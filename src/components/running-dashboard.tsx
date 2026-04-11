@@ -96,6 +96,8 @@ type ActivitiesApiResponse = {
   trainingTargets?: TrainingTarget[];
 };
 
+type SessionMetricKey = "pace" | "hr" | "elevation";
+
 const sourceLabel = {
   strava: "Strava",
   garmin: "Garmin",
@@ -150,6 +152,13 @@ const formatRetryAt = (isoDate: string | null | undefined) => {
     minute: "2-digit",
     timeZoneName: "short",
   }).format(date);
+};
+
+const formatPaceFromSeconds = (seconds: number) => {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0:00";
+  const min = Math.floor(seconds / 60);
+  const sec = Math.round(seconds % 60);
+  return `${min}:${String(sec).padStart(2, "0")}`;
 };
 
 const getWeekKey = (isoDate: string) => {
@@ -247,6 +256,7 @@ export function RunningDashboard() {
   const [stravaQuotaMessage, setStravaQuotaMessage] = useState<string>("");
   const [backfillFromDate, setBackfillFromDate] = useState("");
   const [weekCursor, setWeekCursor] = useState(0);
+  const [sessionMetric, setSessionMetric] = useState<SessionMetricKey>("pace");
 
   const [goalTitle, setGoalTitle] = useState("");
   const [goalType, setGoalType] = useState<GoalType>("weekly-km");
@@ -505,6 +515,47 @@ export function RunningDashboard() {
   }, [paceFactor, paceSec]);
 
   const confidence = Math.max(62, Math.min(93, 90 - Math.abs(selectedActivity.rpe - 7) * 3));
+
+  const paceSplits = selectedActivity.splitsKm.length > 0 ? selectedActivity.splitsKm : selectedActivity.paceSeriesSecPerKm;
+  const hrSplits = (selectedActivity.splitHr && selectedActivity.splitHr.length > 0) ? selectedActivity.splitHr : selectedActivity.hrSeries;
+  const elevationSplits =
+    (selectedActivity.splitElevation && selectedActivity.splitElevation.length > 0)
+      ? selectedActivity.splitElevation
+      : selectedActivity.elevationSeries;
+
+  const sessionSeries = useMemo(() => {
+    if (sessionMetric === "pace") return paceSplits;
+    if (sessionMetric === "hr") return hrSplits;
+    return elevationSplits;
+  }, [elevationSplits, hrSplits, paceSplits, sessionMetric]);
+
+  const sessionMetricMeta = useMemo(() => {
+    if (sessionMetric === "pace") {
+      return {
+        title: "Ritmo por km",
+        colorClass: "session-line-pace",
+        yLabel: "min/km",
+        summary: `Promedio ${selectedActivity.avgPace}`,
+        formatValue: (value: number) => `${formatPaceFromSeconds(value)} min/km`,
+      };
+    }
+    if (sessionMetric === "hr") {
+      return {
+        title: "Frecuencia cardiaca por km",
+        colorClass: "session-line-hr",
+        yLabel: "ppm",
+        summary: `Media ${selectedActivity.avgHr} ppm · Max ${selectedActivity.maxHr} ppm`,
+        formatValue: (value: number) => `${Math.round(value)} ppm`,
+      };
+    }
+    return {
+      title: "Elevacion acumulada por km",
+      colorClass: "session-line-elevation",
+      yLabel: "m",
+      summary: `Desnivel positivo ${selectedActivity.elevationGainM} m`,
+      formatValue: (value: number) => `${Math.round(value)} m`,
+    };
+  }, [selectedActivity.avgHr, selectedActivity.avgPace, selectedActivity.elevationGainM, selectedActivity.maxHr, sessionMetric]);
 
   const goalProgress = (goal: Goal) => {
     if (goal.type === "weekly-km") {
@@ -934,85 +985,61 @@ export function RunningDashboard() {
             </article>
           </div>
 
-          <div className="chart-grid">
-            <article className="chart-card">
-              <h3>Pace por kilometro (real)</h3>
-              <div className="split-bars">
-                {selectedActivity.splitsKm.slice(0, 24).map((split, index) => {
-                  const min = Math.min(...selectedActivity.splitsKm);
-                  const max = Math.max(...selectedActivity.splitsKm);
-                  const range = max - min || 1;
-                  const score = 1 - (split - min) / range;
-                  const height = `${Math.max(16, Math.round(20 + score * 80))}%`;
-                  return (
-                    <div className="split-bar-col" key={`${selectedActivity.id}-pace-${index + 1}`}>
-                      <span className="split-bar" style={{ height }} />
-                      <small>{index + 1}</small>
-                    </div>
-                  );
-                })}
+          <article className="session-chart-card">
+            <div className="session-chart-head">
+              <h3>{sessionMetricMeta.title}</h3>
+              <div className="session-tabs">
+                <button
+                  type="button"
+                  className={`session-tab${sessionMetric === "pace" ? " is-active" : ""}`}
+                  onClick={() => setSessionMetric("pace")}
+                >
+                  Ritmo
+                </button>
+                <button
+                  type="button"
+                  className={`session-tab${sessionMetric === "hr" ? " is-active" : ""}`}
+                  onClick={() => setSessionMetric("hr")}
+                >
+                  FC
+                </button>
+                <button
+                  type="button"
+                  className={`session-tab${sessionMetric === "elevation" ? " is-active" : ""}`}
+                  onClick={() => setSessionMetric("elevation")}
+                >
+                  Elevacion
+                </button>
               </div>
-              <p>
-                {(() => {
-                  const bw = bestAndWorst(selectedActivity.splitsKm);
-                  return bw.best && bw.worst
-                    ? `Mejor: ${toMinutes(bw.best)} min/km · Peor: ${toMinutes(bw.worst)} min/km`
-                    : `Promedio: ${selectedActivity.avgPace}`;
-                })()}
-              </p>
-            </article>
+            </div>
 
-            <article className="chart-card">
-              <h3>FC por kilometro</h3>
-              {selectedActivity.splitHr && selectedActivity.splitHr.length > 0 ? (
-                <>
-                  <div className="split-bars">
-                    {selectedActivity.splitHr.slice(0, 24).map((hr, index) => {
-                      const min = Math.min(...(selectedActivity.splitHr ?? [hr]));
-                      const max = Math.max(...(selectedActivity.splitHr ?? [hr]));
-                      const range = max - min || 1;
-                      const score = (hr - min) / range;
-                      const height = `${Math.max(16, Math.round(20 + score * 80))}%`;
-                      return (
-                        <div className="split-bar-col" key={`${selectedActivity.id}-hr-${index + 1}`}>
-                          <span className="split-bar split-bar-hr" style={{ height }} />
-                          <small>{index + 1}</small>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  <p>
-                    Promedio: {Math.round((selectedActivity.splitHr.reduce((a, b) => a + b, 0) / selectedActivity.splitHr.length) || 0)} ppm · Maxima: {selectedActivity.maxHr} ppm
-                  </p>
-                </>
-              ) : (
-                <p>Sin datos por tramo de FC para esta actividad.</p>
-              )}
-            </article>
-
-            <article className="chart-card">
-              <h3>Elevacion acumulada por km</h3>
-              {selectedActivity.splitElevation && selectedActivity.splitElevation.length > 0 ? (
-                <>
-                  <div className="split-bars">
-                    {selectedActivity.splitElevation.slice(0, 24).map((elev, index) => {
-                      const max = Math.max(...(selectedActivity.splitElevation ?? [elev]), 1);
-                      const height = `${Math.max(8, Math.round((elev / max) * 100))}%`;
-                      return (
-                        <div className="split-bar-col" key={`${selectedActivity.id}-elev-${index + 1}`}>
-                          <span className="split-bar split-bar-elevation" style={{ height }} />
-                          <small>{index + 1}</small>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  <p>Desnivel positivo: {selectedActivity.elevationGainM} m</p>
-                </>
-              ) : (
-                <p>Sin perfil de elevacion por tramo para esta actividad.</p>
-              )}
-            </article>
-          </div>
+            {sessionSeries.length > 1 ? (
+              <>
+                <svg className="session-chart" viewBox="0 0 700 200" role="img">
+                  <path
+                    className={`session-line ${sessionMetricMeta.colorClass}`}
+                    d={buildLinePath(sessionSeries, 700, 180)}
+                    fill="none"
+                  />
+                </svg>
+                <div className="session-axis">
+                  <span>Km 1</span>
+                  <span>Km {Math.max(1, Math.round(sessionSeries.length / 2))}</span>
+                  <span>Km {sessionSeries.length}</span>
+                </div>
+                <p className="session-summary">{sessionMetricMeta.summary}</p>
+                <div className="session-splits-row">
+                  {sessionSeries.slice(0, 16).map((value, index) => (
+                    <span key={`${selectedActivity.id}-metric-${sessionMetric}-${index + 1}`}>
+                      K{index + 1}: {sessionMetricMeta.formatValue(value)}
+                    </span>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <p className="session-summary">No hay datos suficientes por tramos para esta métrica.</p>
+            )}
+          </article>
 
           <div className="notes">
             <h3>Notas de sesion</h3>
