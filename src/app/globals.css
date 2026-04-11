@@ -231,11 +231,12 @@ p {
   display: grid;
   gap: 12px;
   align-content: start;
-  max-height: 78vh;
+  max-height: 82vh;
   overflow: hidden;
   position: sticky;
   top: 14px;
   align-self: start;
+  min-height: 0;
 }
 
 .panel-head {
@@ -257,8 +258,39 @@ p {
 .activity-list {
   display: grid;
   gap: 10px;
-  overflow: auto;
+  overflow-y: auto;
+  min-height: 0;
+  height: calc(82vh - 120px);
   padding-right: 6px;
+}
+
+.activity-week-nav {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.week-nav-button {
+  border: 1px solid rgba(154, 193, 255, 0.24);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  border-radius: 10px;
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.week-nav-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.week-label {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.82rem;
 }
 
 .activity-item {
@@ -842,6 +874,11 @@ td {
   .activity-list-panel {
     position: static;
     max-height: none;
+  }
+
+  .activity-list {
+    height: auto;
+    max-height: 60vh;
   }
 }
 

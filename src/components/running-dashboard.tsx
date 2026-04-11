@@ -152,6 +152,24 @@ const formatRetryAt = (isoDate: string | null | undefined) => {
   }).format(date);
 };
 
+const getWeekKey = (isoDate: string) => {
+  const date = new Date(isoDate);
+  const utc = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = utc.getUTCDay() || 7;
+  utc.setUTCDate(utc.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(utc.getUTCFullYear(), 0, 1));
+  const week = Math.ceil((((utc.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  return `${utc.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+};
+
+const getWeekLabel = (weekKey: string) => {
+  const [yearRaw, weekRaw] = weekKey.split("-W");
+  const year = Number(yearRaw);
+  const week = Number(weekRaw);
+  if (!Number.isFinite(year) || !Number.isFinite(week)) return weekKey;
+  return `Semana ${week} · ${year}`;
+};
+
 const buildLinePath = (values: number[], width = 360, height = 120) => {
   if (values.length === 0) return "";
   const min = Math.min(...values);
@@ -223,6 +241,7 @@ export function RunningDashboard() {
   const [stravaHistoryMessage, setStravaHistoryMessage] = useState<string>("");
   const [stravaQuotaMessage, setStravaQuotaMessage] = useState<string>("");
   const [backfillFromDate, setBackfillFromDate] = useState("");
+  const [weekCursor, setWeekCursor] = useState(0);
 
   const [goalTitle, setGoalTitle] = useState("");
   const [goalType, setGoalType] = useState<GoalType>("weekly-km");
@@ -231,9 +250,31 @@ export function RunningDashboard() {
   const [raceName, setRaceName] = useState("");
   const [raceDistanceKm, setRaceDistanceKm] = useState("");
 
+  const activityWeeks = useMemo(() => {
+    const grouped = new Map<string, RunningActivity[]>();
+    for (const activity of activities) {
+      const key = getWeekKey(activity.date);
+      const current = grouped.get(key) ?? [];
+      current.push(activity);
+      grouped.set(key, current);
+    }
+    return Array.from(grouped.entries())
+      .map(([key, items]) => ({
+        key,
+        label: getWeekLabel(key),
+        items: items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()),
+      }))
+      .sort((a, b) => b.key.localeCompare(a.key));
+  }, [activities]);
+
+  const safeWeekCursor = Math.min(Math.max(weekCursor, 0), Math.max(0, activityWeeks.length - 1));
+  const visibleActivities =
+    activityWeeks[safeWeekCursor]?.items ??
+    activities;
+
   const selectedActivity = useMemo(() => {
-    return activities.find((item) => item.id === selectedId) ?? activities[0] ?? fallbackActivities[0];
-  }, [activities, selectedId]);
+    return visibleActivities.find((item) => item.id === selectedId) ?? visibleActivities[0] ?? activities[0] ?? fallbackActivities[0];
+  }, [activities, selectedId, visibleActivities]);
 
   const updateQuotaMessage = (quota?: StravaQuotaSnapshot | null) => {
     if (!quota) {
@@ -275,6 +316,17 @@ export function RunningDashboard() {
     setAnalysis(null);
     setError(null);
   }, [selectedId]);
+
+  useEffect(() => {
+    setWeekCursor(0);
+  }, [activities.length]);
+
+  useEffect(() => {
+    if (visibleActivities.length === 0) return;
+    if (!visibleActivities.some((item) => item.id === selectedId)) {
+      setSelectedId(visibleActivities[0].id);
+    }
+  }, [selectedId, visibleActivities]);
 
   useEffect(() => {
     let mounted = true;
@@ -789,11 +841,31 @@ export function RunningDashboard() {
         <aside className="panel activity-list-panel">
           <div className="panel-head">
             <h2>Actividades</h2>
-            <span>{activities.length} sesiones</span>
+            <span>{visibleActivities.length} sesiones</span>
+          </div>
+
+          <div className="activity-week-nav">
+            <button
+              type="button"
+              className="week-nav-button"
+              onClick={() => setWeekCursor((current) => Math.min(current + 1, Math.max(0, activityWeeks.length - 1)))}
+              disabled={safeWeekCursor >= activityWeeks.length - 1}
+            >
+              Semana anterior
+            </button>
+            <span className="week-label">{activityWeeks[safeWeekCursor]?.label ?? "Sin semana"}</span>
+            <button
+              type="button"
+              className="week-nav-button"
+              onClick={() => setWeekCursor((current) => Math.max(0, current - 1))}
+              disabled={safeWeekCursor <= 0}
+            >
+              Semana siguiente
+            </button>
           </div>
 
           <div className="activity-list">
-            {activities.map((activity) => {
+            {visibleActivities.map((activity) => {
               const isActive = activity.id === selectedActivity.id;
               return (
                 <button

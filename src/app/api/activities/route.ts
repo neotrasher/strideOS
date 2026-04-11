@@ -38,17 +38,64 @@ const sampleArray = (values: number[], points = SAMPLE_POINTS, fallbackValue = 0
 
   return Array.from({ length: points }, (_, index) => {
     const position = (index / Math.max(1, points - 1)) * (values.length - 1);
-    const value = values[Math.round(position)] ?? fallbackValue;
+    const lower = Math.floor(position);
+    const upper = Math.min(values.length - 1, Math.ceil(position));
+    const ratio = position - lower;
+    const lowValue = values[lower] ?? fallbackValue;
+    const highValue = values[upper] ?? lowValue;
+    const value = lowValue + (highValue - lowValue) * ratio;
     return Math.round(value);
   });
 };
 
 const synthSeries = (base: number, points: number, amplitude: number) =>
   Array.from({ length: points }, (_, index) => {
-    const waveA = Math.sin((index / Math.max(1, points - 1)) * Math.PI * 1.8);
-    const waveB = Math.sin((index / Math.max(1, points - 1)) * Math.PI * 3.2);
+    const x = index / Math.max(1, points - 1);
+    const waveA = Math.sin(x * Math.PI * 1.4);
+    const waveB = Math.sin(x * Math.PI * 2.5);
     return Math.round(base + waveA * amplitude + waveB * (amplitude * 0.45));
   });
+
+const smoothSeries = (values: number[], window = 3) => {
+  if (values.length <= 2) return values;
+  return values.map((_, index) => {
+    const from = Math.max(0, index - Math.floor(window / 2));
+    const to = Math.min(values.length - 1, index + Math.floor(window / 2));
+    const slice = values.slice(from, to + 1);
+    const avg = slice.reduce((sum, item) => sum + item, 0) / Math.max(1, slice.length);
+    return Math.round(avg);
+  });
+};
+
+const buildElevationFallback = (gainM: number, points: number) => {
+  if (gainM <= 3) return Array.from({ length: points }, () => 0);
+  const amplitude = clamp(Math.round(gainM / 7), 4, 22);
+  const raw = Array.from({ length: points }, (_, index) => {
+    const x = index / Math.max(1, points - 1);
+    const wave = Math.sin(x * Math.PI * 1.6) * amplitude;
+    const micro = Math.sin(x * Math.PI * 4.0) * Math.max(1, Math.round(amplitude * 0.22));
+    return wave + micro;
+  });
+  const min = Math.min(...raw);
+  return raw.map((value) => Math.round(value - min));
+};
+
+const buildHrFromPace = (paceSeries: number[], avgHr: number, maxHr: number) => {
+  if (paceSeries.length === 0) return [];
+  const paceMin = Math.min(...paceSeries);
+  const paceMax = Math.max(...paceSeries);
+  const paceRange = Math.max(1, paceMax - paceMin);
+  const safeAvg = avgHr > 0 ? avgHr : 145;
+  const safeMax = maxHr > safeAvg ? maxHr : safeAvg + 10;
+
+  const inferred = paceSeries.map((pace, index) => {
+    const intensity = (paceMax - pace) / paceRange;
+    const drift = Math.sin((index / Math.max(1, paceSeries.length - 1)) * Math.PI) * 3;
+    const value = safeAvg - 4 + intensity * (safeMax - safeAvg + 4) + drift;
+    return Math.round(clamp(value, safeAvg - 10, safeMax));
+  });
+  return smoothSeries(inferred, 3);
+};
 
 const secPerKmToPace = (secPerKm: number | null) => {
   if (!secPerKm || secPerKm <= 0) return "0:00 /km";
@@ -206,22 +253,23 @@ const mapActivity = (activity: {
   const paceSeriesFromSplits =
     splitValues.length > 0 ? sampleArray(splitValues, SAMPLE_POINTS, splitValues[0] ?? 300) : [];
 
-  const paceSeries =
+  const paceSeriesRaw =
     paceStream.length > 0
       ? sampleArray(paceStream, SAMPLE_POINTS, avgPaceSec ? Math.round(avgPaceSec) : 300)
       : paceSeriesFromSplits.length > 0
         ? paceSeriesFromSplits
-        : synthSeries(Math.round(avgPaceSec ?? 300), SAMPLE_POINTS, 10);
+        : synthSeries(Math.round(avgPaceSec ?? 300), SAMPLE_POINTS, 4);
+  const paceSeries = smoothSeries(paceSeriesRaw, 3);
 
   const hrSeries =
     hrStream.length > 0
-      ? sampleArray(hrStream, SAMPLE_POINTS, avgHr || 140)
-      : synthSeries(avgHr || 142, SAMPLE_POINTS, clamp(((maxHr || avgHr || 150) - (avgHr || 140)) / 2, 4, 14));
+      ? smoothSeries(sampleArray(hrStream, SAMPLE_POINTS, avgHr || 140), 3)
+      : buildHrFromPace(paceSeries, avgHr || 145, maxHr || 160);
 
   const elevationSeries =
     elevationStream.length > 0
-      ? sampleArray(elevationStream, SAMPLE_POINTS, Math.round(activity.elevationGainM ?? 0))
-      : synthSeries(clamp(Math.round((activity.elevationGainM ?? 50) / 3), 8, 65), SAMPLE_POINTS, 7);
+      ? smoothSeries(sampleArray(elevationStream, SAMPLE_POINTS, Math.round(activity.elevationGainM ?? 0)), 3)
+      : buildElevationFallback(Math.round(activity.elevationGainM ?? 0), SAMPLE_POINTS);
 
   const workoutType = mapWorkoutType(activity.sport);
   const zoneDistribution = buildZoneDistribution(hrSeries, avgHr || 0);
