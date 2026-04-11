@@ -23,13 +23,11 @@ const toNumberArray = (value: unknown): number[] => {
   return value.map((item) => Number(item)).filter((item) => Number.isFinite(item));
 };
 
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
-
 const trimText = (value: string | null | undefined, max = 220) => {
   if (!value) return null;
   const clean = value.replace(/\s+/g, " ").trim();
   if (clean.length <= max) return clean;
-  return `${clean.slice(0, max - 1)}…`;
+  return `${clean.slice(0, max - 3)}...`;
 };
 
 const sampleArray = (values: number[], points = SAMPLE_POINTS, fallbackValue = 0): number[] => {
@@ -43,18 +41,9 @@ const sampleArray = (values: number[], points = SAMPLE_POINTS, fallbackValue = 0
     const ratio = position - lower;
     const lowValue = values[lower] ?? fallbackValue;
     const highValue = values[upper] ?? lowValue;
-    const value = lowValue + (highValue - lowValue) * ratio;
-    return Math.round(value);
+    return Math.round(lowValue + (highValue - lowValue) * ratio);
   });
 };
-
-const synthSeries = (base: number, points: number, amplitude: number) =>
-  Array.from({ length: points }, (_, index) => {
-    const x = index / Math.max(1, points - 1);
-    const waveA = Math.sin(x * Math.PI * 1.4);
-    const waveB = Math.sin(x * Math.PI * 2.5);
-    return Math.round(base + waveA * amplitude + waveB * (amplitude * 0.45));
-  });
 
 const smoothSeries = (values: number[], window = 3) => {
   if (values.length <= 2) return values;
@@ -67,34 +56,19 @@ const smoothSeries = (values: number[], window = 3) => {
   });
 };
 
-const buildElevationFallback = (gainM: number, points: number) => {
-  if (gainM <= 3) return Array.from({ length: points }, () => 0);
-  const amplitude = clamp(Math.round(gainM / 7), 4, 22);
-  const raw = Array.from({ length: points }, (_, index) => {
-    const x = index / Math.max(1, points - 1);
-    const wave = Math.sin(x * Math.PI * 1.6) * amplitude;
-    const micro = Math.sin(x * Math.PI * 4.0) * Math.max(1, Math.round(amplitude * 0.22));
-    return wave + micro;
-  });
-  const min = Math.min(...raw);
-  return raw.map((value) => Math.round(value - min));
-};
+const repeatSeries = (value: number, points: number) =>
+  Array.from({ length: points }, () => Math.round(value));
 
-const buildHrFromPace = (paceSeries: number[], avgHr: number, maxHr: number) => {
-  if (paceSeries.length === 0) return [];
-  const paceMin = Math.min(...paceSeries);
-  const paceMax = Math.max(...paceSeries);
-  const paceRange = Math.max(1, paceMax - paceMin);
-  const safeAvg = avgHr > 0 ? avgHr : 145;
-  const safeMax = maxHr > safeAvg ? maxHr : safeAvg + 10;
-
-  const inferred = paceSeries.map((pace, index) => {
-    const intensity = (paceMax - pace) / paceRange;
-    const drift = Math.sin((index / Math.max(1, paceSeries.length - 1)) * Math.PI) * 3;
-    const value = safeAvg - 4 + intensity * (safeMax - safeAvg + 4) + drift;
-    return Math.round(clamp(value, safeAvg - 10, safeMax));
-  });
-  return smoothSeries(inferred, 3);
+const buildCumulativeElevationFromSplits = (splitElevationDiffs: number[]) => {
+  if (splitElevationDiffs.length === 0) return [];
+  const cumulative: number[] = [];
+  let total = 0;
+  for (const diff of splitElevationDiffs) {
+    total += diff;
+    cumulative.push(Math.round(total));
+  }
+  const min = Math.min(...cumulative);
+  return cumulative.map((value) => value - min);
 };
 
 const secPerKmToPace = (secPerKm: number | null) => {
@@ -236,12 +210,19 @@ const mapActivity = (activity: {
   const avgPower = activity.averagePower ?? toNumber(detail?.average_watts) ?? 0;
   const tss = Math.round(toNumber(detail?.suffer_score) ?? estimateTss(movingTimeMin, avgHr));
 
-  const splitValues = Array.isArray(detail?.splits_metric)
-    ? (detail.splits_metric as unknown[])
-        .map((item) => (isRecord(item) ? toNumber(item.average_speed) : null))
-        .map((speed) => (speed && speed > 0 ? Math.round(1000 / speed) : null))
-        .filter((item): item is number => item !== null)
+  const splitRecords = Array.isArray(detail?.splits_metric)
+    ? (detail.splits_metric as unknown[]).filter((item): item is JsonRecord => isRecord(item))
     : [];
+  const splitPaceValues = splitRecords
+    .map((item) => toNumber(item.average_speed))
+    .map((speed) => (speed && speed > 0 ? Math.round(1000 / speed) : null))
+    .filter((item): item is number => item !== null);
+  const splitHrValues = splitRecords
+    .map((item) => toNumber(item.average_heartrate))
+    .filter((item): item is number => item !== null && item > 0);
+  const splitElevationDiffValues = splitRecords
+    .map((item) => toNumber(item.elevation_difference))
+    .filter((item): item is number => item !== null);
 
   const hrStream = streams && isRecord(streams.heartrate) ? toNumberArray(streams.heartrate.data) : [];
   const paceStreamRaw = streams && isRecord(streams.velocity_smooth) ? toNumberArray(streams.velocity_smooth.data) : [];
@@ -250,26 +231,27 @@ const mapActivity = (activity: {
     .map((speed) => (speed > 0 ? 1000 / speed : 0))
     .filter((item) => Number.isFinite(item) && item > 0);
 
-  const paceSeriesFromSplits =
-    splitValues.length > 0 ? sampleArray(splitValues, SAMPLE_POINTS, splitValues[0] ?? 300) : [];
-
-  const paceSeriesRaw =
+  const paceSeries =
     paceStream.length > 0
-      ? sampleArray(paceStream, SAMPLE_POINTS, avgPaceSec ? Math.round(avgPaceSec) : 300)
-      : paceSeriesFromSplits.length > 0
-        ? paceSeriesFromSplits
-        : synthSeries(Math.round(avgPaceSec ?? 300), SAMPLE_POINTS, 4);
-  const paceSeries = smoothSeries(paceSeriesRaw, 3);
+      ? smoothSeries(sampleArray(paceStream, SAMPLE_POINTS, avgPaceSec ? Math.round(avgPaceSec) : 300), 3)
+      : splitPaceValues.length > 0
+        ? smoothSeries(sampleArray(splitPaceValues, SAMPLE_POINTS, splitPaceValues[0]), 3)
+        : repeatSeries(Math.round(avgPaceSec ?? 300), SAMPLE_POINTS);
 
   const hrSeries =
     hrStream.length > 0
       ? smoothSeries(sampleArray(hrStream, SAMPLE_POINTS, avgHr || 140), 3)
-      : buildHrFromPace(paceSeries, avgHr || 145, maxHr || 160);
+      : splitHrValues.length > 0
+        ? smoothSeries(sampleArray(splitHrValues, SAMPLE_POINTS, splitHrValues[0]), 3)
+        : repeatSeries(Math.round(avgHr || 140), SAMPLE_POINTS);
 
+  const splitElevationProfile = buildCumulativeElevationFromSplits(splitElevationDiffValues);
   const elevationSeries =
     elevationStream.length > 0
       ? smoothSeries(sampleArray(elevationStream, SAMPLE_POINTS, Math.round(activity.elevationGainM ?? 0)), 3)
-      : buildElevationFallback(Math.round(activity.elevationGainM ?? 0), SAMPLE_POINTS);
+      : splitElevationProfile.length > 0
+        ? smoothSeries(sampleArray(splitElevationProfile, SAMPLE_POINTS, splitElevationProfile[0]), 3)
+        : repeatSeries(0, SAMPLE_POINTS);
 
   const workoutType = mapWorkoutType(activity.sport);
   const zoneDistribution = buildZoneDistribution(hrSeries, avgHr || 0);
@@ -296,8 +278,8 @@ const mapActivity = (activity: {
     tss,
     rpe: activity.rpe ?? estimateRpe(tss),
     splitsKm:
-      splitValues.length > 0
-        ? splitValues
+      splitPaceValues.length > 0
+        ? splitPaceValues
         : sampleArray(paceSeries, estimatedSplitCount, paceSeries[0]),
     paceSeriesSecPerKm: paceSeries,
     hrSeries,
