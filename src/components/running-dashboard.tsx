@@ -1,0 +1,1131 @@
+﻿"use client";
+
+import { useEffect, useMemo, useState, useTransition } from "react";
+
+import {
+  dashboardStats,
+  latestActivityId,
+  runningActivities,
+  trainingTargets,
+  weeklyTrend,
+} from "@/lib/dashboard-data";
+
+type AnalyzeResponse = {
+  summary: string;
+  insights: string[];
+  recommendation: string;
+  score: number;
+  source: "openai" | "fallback";
+  model?: string;
+};
+
+type GoalType = "weekly-km" | "weekly-load" | "10k-time";
+type GoalStatus = "active" | "completed" | "paused";
+
+type Goal = {
+  id: string;
+  title: string;
+  type: GoalType;
+  status: GoalStatus;
+  target: number;
+  dueDate: string;
+  raceName?: string | null;
+  raceDistanceKm?: number | null;
+};
+
+type RacePredict = {
+  label: string;
+  distanceKm: number;
+  predictedSeconds: number;
+};
+
+type GoalDraft = {
+  title: string;
+  type: GoalType;
+  target: string;
+  dueDate: string;
+  raceName: string;
+  raceDistanceKm: string;
+};
+
+type QuotaWindow = {
+  used: number;
+  limit: number;
+  remaining: number;
+  resetAtUtc: string;
+};
+
+type StravaQuotaSnapshot = {
+  capturedAtUtc: string;
+  general: {
+    quarterHour: QuotaWindow;
+    daily: QuotaWindow;
+  };
+  read: {
+    quarterHour: QuotaWindow;
+    daily: QuotaWindow;
+  };
+};
+
+type SyncApiResult = {
+  status?: "success" | "throttled";
+  importedCount?: number;
+  updatedCount?: number;
+  requestsUsed?: number;
+  error?: string;
+  retryAtUtc?: string | null;
+  message?: string | null;
+  quota?: StravaQuotaSnapshot | null;
+};
+
+const sourceLabel = {
+  strava: "Strava",
+  garmin: "Garmin",
+} as const;
+
+const goalTypeLabel: Record<GoalType, string> = {
+  "weekly-km": "Km semana",
+  "weekly-load": "Carga semanal",
+  "10k-time": "Tiempo 10K",
+};
+
+const initialGoals: Goal[] = [
+  {
+    id: "fallback-1",
+    title: "Subir volumen base",
+    type: "weekly-km",
+    status: "active",
+    target: 70,
+    dueDate: "2026-05-15",
+    raceName: null,
+    raceDistanceKm: null,
+  },
+];
+
+const toMinutes = (seconds: number) => Math.round((seconds / 60) * 10) / 10;
+
+const formatDate = (isoDate: string) =>
+  new Intl.DateTimeFormat("es-CO", {
+    weekday: "short",
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(isoDate));
+
+const formatDateShort = (isoDate: string) =>
+  new Intl.DateTimeFormat("es-CO", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(isoDate));
+
+const formatRetryAt = (isoDate: string | null | undefined) => {
+  if (!isoDate) return null;
+  const date = new Date(isoDate);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Intl.DateTimeFormat("es-CO", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(date);
+};
+
+const buildLinePath = (values: number[], width = 360, height = 120) => {
+  if (values.length === 0) return "";
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+
+  return values
+    .map((value, index) => {
+      const x = (index / (values.length - 1 || 1)) * width;
+      const normalized = (value - min) / range;
+      const y = height - normalized * height;
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .join(" ");
+};
+
+const resolveBarHeight = (value: number, max: number) => {
+  if (max <= 0) return "8%";
+  return `${Math.max(8, Math.round((value / max) * 100))}%`;
+};
+
+const paceToSeconds = (pace: string) => {
+  const [minutes, seconds] = pace.split(" ")[0].split(":").map(Number);
+  return minutes * 60 + seconds;
+};
+
+const formatRaceTime = (totalSeconds: number) => {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = Math.round(totalSeconds % 60);
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+};
+
+const formatGoalTarget = (goal: Goal) => {
+  if (goal.type === "10k-time") return formatRaceTime(goal.target);
+  return String(goal.target);
+};
+
+const statusLabel: Record<GoalStatus, string> = {
+  active: "Activo",
+  completed: "Completado",
+  paused: "Pausado",
+};
+
+export function RunningDashboard() {
+  const [selectedId, setSelectedId] = useState<string>(latestActivityId);
+  const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const [goals, setGoals] = useState<Goal[]>([]);
+  const [goalsLoading, setGoalsLoading] = useState(true);
+  const [goalsError, setGoalsError] = useState<string | null>(null);
+  const [goalSaving, setGoalSaving] = useState(false);
+  const [goalDeletingId, setGoalDeletingId] = useState<string | null>(null);
+  const [editingGoalId, setEditingGoalId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<GoalDraft | null>(null);
+  const [stravaConnected, setStravaConnected] = useState(false);
+  const [stravaExpiresAt, setStravaExpiresAt] = useState<string | null>(null);
+  const [stravaSyncing, setStravaSyncing] = useState(false);
+  const [stravaBackfilling, setStravaBackfilling] = useState(false);
+  const [stravaSyncMessage, setStravaSyncMessage] = useState<string>("");
+  const [stravaHistoryMessage, setStravaHistoryMessage] = useState<string>("");
+  const [stravaQuotaMessage, setStravaQuotaMessage] = useState<string>("");
+  const [backfillFromDate, setBackfillFromDate] = useState("");
+
+  const [goalTitle, setGoalTitle] = useState("");
+  const [goalType, setGoalType] = useState<GoalType>("weekly-km");
+  const [goalTarget, setGoalTarget] = useState("70");
+  const [goalDate, setGoalDate] = useState("2026-06-15");
+  const [raceName, setRaceName] = useState("");
+  const [raceDistanceKm, setRaceDistanceKm] = useState("");
+
+  const selectedActivity = useMemo(() => {
+    return runningActivities.find((item) => item.id === selectedId) ?? runningActivities[0];
+  }, [selectedId]);
+
+  const updateQuotaMessage = (quota?: StravaQuotaSnapshot | null) => {
+    if (!quota) {
+      setStravaQuotaMessage("");
+      return;
+    }
+    setStravaQuotaMessage(
+      `Cuota Strava - 15min: gen ${quota.general.quarterHour.used}/${quota.general.quarterHour.limit}, lectura ${quota.read.quarterHour.used}/${quota.read.quarterHour.limit}. Diario: gen ${quota.general.daily.used}/${quota.general.daily.limit}, lectura ${quota.read.daily.used}/${quota.read.daily.limit}.`,
+    );
+  };
+
+  const refreshStravaOverview = async () => {
+    try {
+      const response = await fetch("/api/strava/sync");
+      if (!response.ok) return;
+      const payload = (await response.json()) as {
+        latest?: { quotaSnapshot?: StravaQuotaSnapshot | null } | null;
+        history?: {
+          totalActivities?: number;
+          oldestStartedAt?: string | null;
+          newestStartedAt?: string | null;
+        } | null;
+      };
+
+      if (payload.history?.totalActivities && payload.history.totalActivities > 0) {
+        const oldest = payload.history.oldestStartedAt ? formatDateShort(payload.history.oldestStartedAt) : "?";
+        const newest = payload.history.newestStartedAt ? formatDateShort(payload.history.newestStartedAt) : "?";
+        setStravaHistoryMessage(
+          `Historial sincronizado: ${payload.history.totalActivities} actividades (${oldest} -> ${newest}).`,
+        );
+      } else {
+        setStravaHistoryMessage("Aun no hay historial sincronizado.");
+      }
+      updateQuotaMessage(payload.latest?.quotaSnapshot ?? null);
+    } catch {
+      // no-op
+    }
+  };
+
+  useEffect(() => {
+    setAnalysis(null);
+    setError(null);
+  }, [selectedId]);
+
+  useEffect(() => {
+    let mounted = true;
+    const loadStravaStatus = async () => {
+      try {
+        const response = await fetch("/api/strava/status");
+        if (!response.ok) return;
+        const payload = (await response.json()) as { connected?: boolean; expiresAt?: string | null };
+        if (!mounted) return;
+        setStravaConnected(Boolean(payload.connected));
+        setStravaExpiresAt(payload.expiresAt ?? null);
+      } catch {
+        if (!mounted) return;
+        setStravaConnected(false);
+      }
+    };
+    loadStravaStatus();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const loadSyncStatus = async () => {
+      try {
+        const response = await fetch("/api/strava/sync");
+        if (!response.ok) return;
+        const payload = (await response.json()) as {
+          latest?: {
+            status?: string;
+            importedCount?: number;
+            finishedAt?: string | null;
+            error?: string | null;
+            retryAtUtc?: string | null;
+            quotaSnapshot?: StravaQuotaSnapshot | null;
+          } | null;
+          history?: {
+            totalActivities?: number;
+            oldestStartedAt?: string | null;
+            newestStartedAt?: string | null;
+          } | null;
+        };
+        if (!mounted) return;
+
+        if (payload.latest?.status === "SUCCESS") {
+          setStravaSyncMessage(
+            `Ultima sync OK: ${payload.latest.importedCount ?? 0} actividades` +
+              (payload.latest.finishedAt ? ` (${payload.latest.finishedAt.slice(0, 19).replace("T", " ")})` : ""),
+          );
+        } else if (payload.latest?.status === "FAILED") {
+          setStravaSyncMessage(`Ultima sync fallo: ${payload.latest.error ?? "sin detalle"}`);
+        }
+
+        if (payload.latest?.error && payload.latest.retryAtUtc) {
+          const retryAt = formatRetryAt(payload.latest.retryAtUtc);
+          if (retryAt) {
+            setStravaSyncMessage(`${payload.latest.error} Reintenta desde ${retryAt}.`);
+          }
+        }
+
+        await refreshStravaOverview();
+      } catch {
+        // ignore non-critical sync status load errors
+      }
+    };
+    loadSyncStatus();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    const loadGoals = async () => {
+      setGoalsLoading(true);
+      setGoalsError(null);
+      try {
+        const response = await fetch("/api/goals");
+        if (!response.ok) {
+          throw new Error("No se pudieron cargar los objetivos.");
+        }
+        const payload = (await response.json()) as { items?: Goal[] };
+        if (!isMounted) return;
+        setGoals(Array.isArray(payload.items) ? payload.items : []);
+      } catch (loadError) {
+        if (!isMounted) return;
+        setGoals(initialGoals);
+        setGoalsError(loadError instanceof Error ? loadError.message : "Error al cargar objetivos.");
+      } finally {
+        if (isMounted) setGoalsLoading(false);
+      }
+    };
+
+    loadGoals();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const maxDistance = Math.max(...weeklyTrend.map((item) => item.distanceKm));
+  const maxLoad = Math.max(...weeklyTrend.map((item) => item.load));
+  const latestWeek = weeklyTrend[weeklyTrend.length - 1];
+  const paceSec = paceToSeconds(selectedActivity.avgPace);
+  const paceFactor = Math.max(0.92, Math.min(1.08, 1 + (selectedActivity.tss - 70) / 600));
+
+  const predictions: RacePredict[] = useMemo(() => {
+    const distances = [
+      { label: "5K", distanceKm: 5 },
+      { label: "10K", distanceKm: 10 },
+      { label: "21K", distanceKm: 21.097 },
+      { label: "42K", distanceKm: 42.195 },
+    ];
+
+    return distances.map((item) => {
+      const base = paceSec * item.distanceKm;
+      const multiplier = item.distanceKm <= 10 ? 0.99 : item.distanceKm <= 21.097 ? 1.04 : 1.11;
+      return {
+        label: item.label,
+        distanceKm: item.distanceKm,
+        predictedSeconds: Math.round(base * multiplier * paceFactor),
+      };
+    });
+  }, [paceFactor, paceSec]);
+
+  const confidence = Math.max(62, Math.min(93, 90 - Math.abs(selectedActivity.rpe - 7) * 3));
+
+  const goalProgress = (goal: Goal) => {
+    if (goal.type === "weekly-km") {
+      const percent = Math.round((latestWeek.distanceKm / goal.target) * 100);
+      return Math.min(160, Math.max(0, percent));
+    }
+    if (goal.type === "weekly-load") {
+      const percent = Math.round((latestWeek.load / goal.target) * 100);
+      return Math.min(160, Math.max(0, percent));
+    }
+
+    const tenKPred = predictions.find((item) => item.label === "10K")?.predictedSeconds ?? 0;
+    if (tenKPred === 0 || goal.target <= 0) return 0;
+    const percent = Math.round((goal.target / tenKPred) * 100);
+    return Math.min(160, Math.max(0, percent));
+  };
+
+  const goalProgressText = (goal: Goal) => {
+    if (goal.type === "weekly-km") return `${latestWeek.distanceKm} / ${goal.target} km`;
+    if (goal.type === "weekly-load") return `${latestWeek.load} / ${goal.target} load`;
+
+    const tenKPred = predictions.find((item) => item.label === "10K")?.predictedSeconds ?? 0;
+    return `${formatRaceTime(tenKPred)} vs objetivo ${formatRaceTime(goal.target)}`;
+  };
+
+  const addGoal = async () => {
+    const target = Number(goalTarget);
+    if (!goalTitle.trim() || !Number.isFinite(target) || target <= 0 || !goalDate) {
+      return;
+    }
+
+    const raceDistance = raceDistanceKm.trim() ? Number(raceDistanceKm) : null;
+    if (raceDistance !== null && (!Number.isFinite(raceDistance) || raceDistance <= 0)) {
+      setGoalsError("La distancia de carrera no es valida.");
+      return;
+    }
+
+    setGoalSaving(true);
+    setGoalsError(null);
+    try {
+      const response = await fetch("/api/goals", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: goalTitle.trim(),
+          type: goalType,
+          target,
+          dueDate: goalDate,
+          raceName: raceName.trim() || null,
+          raceDistanceKm: raceDistance,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("No se pudo guardar el objetivo.");
+      }
+
+      const payload = (await response.json()) as { item?: Goal };
+      if (payload.item) {
+        setGoals((current) => [payload.item as Goal, ...current]);
+      }
+
+      setGoalTitle("");
+      setRaceName("");
+      setRaceDistanceKm("");
+    } catch (saveError) {
+      setGoalsError(saveError instanceof Error ? saveError.message : "Error al crear objetivo.");
+    } finally {
+      setGoalSaving(false);
+    }
+  };
+
+  const startEditingGoal = (goal: Goal) => {
+    setEditingGoalId(goal.id);
+    setEditDraft({
+      title: goal.title,
+      type: goal.type,
+      target: String(goal.target),
+      dueDate: goal.dueDate,
+      raceName: goal.raceName ?? "",
+      raceDistanceKm: goal.raceDistanceKm ? String(goal.raceDistanceKm) : "",
+    });
+  };
+
+  const cancelEditing = () => {
+    setEditingGoalId(null);
+    setEditDraft(null);
+  };
+
+  const saveGoal = async (goalId: string) => {
+    if (!editDraft) return;
+    const target = Number(editDraft.target);
+    const raceDistance = editDraft.raceDistanceKm.trim() ? Number(editDraft.raceDistanceKm) : null;
+    if (!editDraft.title.trim() || !Number.isFinite(target) || target <= 0 || !editDraft.dueDate) {
+      setGoalsError("Revisa los datos del objetivo antes de guardar.");
+      return;
+    }
+    if (raceDistance !== null && (!Number.isFinite(raceDistance) || raceDistance <= 0)) {
+      setGoalsError("La distancia de carrera no es valida.");
+      return;
+    }
+
+    setGoalsError(null);
+    try {
+      const response = await fetch(`/api/goals/${goalId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: editDraft.title.trim(),
+          type: editDraft.type,
+          target,
+          dueDate: editDraft.dueDate,
+          raceName: editDraft.raceName.trim() || null,
+          raceDistanceKm: raceDistance,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error("No se pudo actualizar el objetivo.");
+      }
+      const payload = (await response.json()) as { item?: Goal };
+      if (payload.item) {
+        setGoals((current) =>
+          current.map((goal) => (goal.id === goalId ? (payload.item as Goal) : goal)),
+        );
+      }
+      cancelEditing();
+    } catch (updateError) {
+      setGoalsError(updateError instanceof Error ? updateError.message : "Error al actualizar.");
+    }
+  };
+
+  const toggleGoalCompleted = async (goal: Goal) => {
+    const newStatus: GoalStatus = goal.status === "completed" ? "active" : "completed";
+    try {
+      const response = await fetch(`/api/goals/${goal.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (!response.ok) {
+        throw new Error("No se pudo actualizar estado.");
+      }
+      const payload = (await response.json()) as { item?: Goal };
+      if (payload.item) {
+        setGoals((current) =>
+          current.map((item) => (item.id === goal.id ? (payload.item as Goal) : item)),
+        );
+      }
+    } catch (toggleError) {
+      setGoalsError(toggleError instanceof Error ? toggleError.message : "Error al cambiar estado.");
+    }
+  };
+
+  const removeGoal = async (goalId: string) => {
+    setGoalDeletingId(goalId);
+    setGoalsError(null);
+    try {
+      const response = await fetch(`/api/goals/${goalId}`, { method: "DELETE" });
+      if (!response.ok) {
+        throw new Error("No se pudo eliminar el objetivo.");
+      }
+      setGoals((current) => current.filter((goal) => goal.id !== goalId));
+    } catch (deleteError) {
+      setGoalsError(deleteError instanceof Error ? deleteError.message : "Error al eliminar objetivo.");
+    } finally {
+      setGoalDeletingId(null);
+    }
+  };
+
+  const syncStravaNow = async () => {
+    setStravaSyncing(true);
+    setStravaSyncMessage("Sincronizando actividades de Strava...");
+    try {
+      const response = await fetch("/api/strava/sync", { method: "POST" });
+      const payload = (await response.json()) as SyncApiResult;
+      if (!response.ok) {
+        throw new Error(payload.error || "No se pudo completar la sincronizacion.");
+      }
+      if (payload.status === "throttled") {
+        const retryAt = formatRetryAt(payload.retryAtUtc);
+        setStravaSyncMessage(
+          `${payload.message ?? "Sync pausada por cuota."}${retryAt ? ` Vuelve a intentar desde ${retryAt}.` : ""}`,
+        );
+      } else {
+        setStravaSyncMessage(
+          `Sync completada: ${payload.importedCount ?? 0} nuevas, ${payload.updatedCount ?? 0} actualizadas.`,
+        );
+      }
+      updateQuotaMessage(payload.quota ?? null);
+      await refreshStravaOverview();
+    } catch (syncError) {
+      setStravaSyncMessage(syncError instanceof Error ? syncError.message : "Error en sincronizacion.");
+    } finally {
+      setStravaSyncing(false);
+    }
+  };
+
+  const runBackfill = async () => {
+    setStravaBackfilling(true);
+    setStravaSyncMessage("Backfill historico en progreso...");
+    try {
+      const response = await fetch("/api/strava/backfill", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fromDate: backfillFromDate || undefined,
+          includeStreams: false,
+          maxPages: 3,
+          maxRequests: 60,
+        }),
+      });
+      const payload = (await response.json()) as SyncApiResult;
+      if (!response.ok) {
+        throw new Error(payload.error || "No se pudo ejecutar backfill.");
+      }
+      if (payload.status === "throttled") {
+        const retryAt = formatRetryAt(payload.retryAtUtc);
+        setStravaSyncMessage(
+          `${payload.message ?? "Backfill pausado por cuota."}${retryAt ? ` Reanuda desde ${retryAt}.` : ""}`,
+        );
+      } else {
+        setStravaSyncMessage(
+          `Backfill OK: +${payload.importedCount ?? 0} nuevas, ${payload.updatedCount ?? 0} actualizadas (${payload.requestsUsed ?? 0} requests).`,
+        );
+      }
+      updateQuotaMessage(payload.quota ?? null);
+      await refreshStravaOverview();
+    } catch (backfillError) {
+      setStravaSyncMessage(backfillError instanceof Error ? backfillError.message : "Error en backfill.");
+    } finally {
+      setStravaBackfilling(false);
+    }
+  };
+
+  const analyzeActivity = () => {
+    startTransition(async () => {
+      setError(null);
+      try {
+        const response = await fetch("/api/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ activityId: selectedActivity.id }),
+        });
+
+        if (!response.ok) {
+          throw new Error("No se pudo analizar la actividad.");
+        }
+
+        const payload = (await response.json()) as AnalyzeResponse;
+        setAnalysis(payload);
+      } catch (requestError) {
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : "Error inesperado en el analisis.",
+        );
+      }
+    });
+  };
+
+  return (
+    <main className="dashboard-shell">
+      <header className="dashboard-header">
+        <div>
+          <p className="kicker">StrideOS Running</p>
+          <h1>Dashboard de actividades, predicts y objetivos</h1>
+          <p className="subtitle">
+            Historial, metricas de rendimiento, graficas de sesion, prediccion de carrera y analisis
+            automatizado con IA.
+          </p>
+          <div className="strava-connect">
+            <span className={`status-dot${stravaConnected ? " is-on" : ""}`} />
+            <span>
+              {stravaConnected
+                ? `Strava conectado${stravaExpiresAt ? ` (expira ${stravaExpiresAt.slice(0, 10)})` : ""}`
+                : "Strava no conectado"}
+            </span>
+            <a className="strava-link" href="/api/strava/connect">
+              {stravaConnected ? "Reconectar Strava" : "Conectar Strava"}
+            </a>
+            {stravaConnected ? (
+              <button className="strava-sync-button" disabled={stravaSyncing} onClick={syncStravaNow} type="button">
+                {stravaSyncing ? "Sincronizando..." : "Sincronizar ahora"}
+              </button>
+            ) : null}
+            {stravaConnected ? (
+              <button
+                className="strava-sync-button strava-backfill-button"
+                disabled={stravaBackfilling}
+                onClick={runBackfill}
+                type="button"
+              >
+                {stravaBackfilling ? "Backfill..." : "Backfill historico"}
+              </button>
+            ) : null}
+            {stravaConnected ? (
+              <input
+                className="strava-date-input"
+                type="date"
+                value={backfillFromDate}
+                onChange={(event) => setBackfillFromDate(event.target.value)}
+                title="Fecha minima para backfill (opcional)"
+              />
+            ) : null}
+          </div>
+          {stravaSyncMessage ? <p className="strava-sync-message">{stravaSyncMessage}</p> : null}
+          {stravaHistoryMessage ? <p className="strava-sync-message">{stravaHistoryMessage}</p> : null}
+          {stravaQuotaMessage ? <p className="strava-sync-message">{stravaQuotaMessage}</p> : null}
+        </div>
+        <div className="header-badges">
+          {trainingTargets.map((target) => (
+            <article key={target.label} className="header-pill">
+              <span>{target.label}</span>
+              <strong>{target.value}</strong>
+            </article>
+          ))}
+        </div>
+      </header>
+
+      <section className="kpi-grid">
+        {dashboardStats.map((stat) => (
+          <article key={stat.label} className="kpi-card">
+            <span>{stat.label}</span>
+            <strong>{stat.value}</strong>
+            <small>{stat.helper}</small>
+          </article>
+        ))}
+      </section>
+
+      <section className="content-grid">
+        <aside className="panel activity-list-panel">
+          <div className="panel-head">
+            <h2>Actividades</h2>
+            <span>{runningActivities.length} sesiones</span>
+          </div>
+
+          <div className="activity-list">
+            {runningActivities.map((activity) => {
+              const isActive = activity.id === selectedActivity.id;
+              return (
+                <button
+                  className={`activity-item${isActive ? " is-active" : ""}`}
+                  key={activity.id}
+                  onClick={() => setSelectedId(activity.id)}
+                  type="button"
+                >
+                  <div className="activity-item-head">
+                    <span>{activity.workoutType}</span>
+                    <strong>{sourceLabel[activity.source]}</strong>
+                  </div>
+                  <h3>{activity.title}</h3>
+                  <p>{formatDate(activity.date)}</p>
+                  <div className="activity-item-metrics">
+                    <span>{activity.distanceKm.toFixed(1)} km</span>
+                    <span>{activity.avgPace}</span>
+                    <span>TSS {activity.tss}</span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </aside>
+
+        <section className="panel detail-panel">
+          <div className="panel-head">
+            <div>
+              <h2>{selectedActivity.title}</h2>
+              <p>{selectedActivity.planTarget}</p>
+            </div>
+            <button className="analyze-button" disabled={isPending} onClick={analyzeActivity} type="button">
+              {isPending ? "Analizando..." : "Analizar con IA"}
+            </button>
+          </div>
+
+          <div className="detail-metrics-grid">
+            <article>
+              <span>Distancia</span>
+              <strong>{selectedActivity.distanceKm.toFixed(1)} km</strong>
+            </article>
+            <article>
+              <span>Tiempo mov.</span>
+              <strong>{selectedActivity.movingTimeMin} min</strong>
+            </article>
+            <article>
+              <span>Ritmo medio</span>
+              <strong>{selectedActivity.avgPace}</strong>
+            </article>
+            <article>
+              <span>FC media</span>
+              <strong>{selectedActivity.avgHr} ppm</strong>
+            </article>
+            <article>
+              <span>Cadencia</span>
+              <strong>{selectedActivity.cadence} spm</strong>
+            </article>
+            <article>
+              <span>Potencia</span>
+              <strong>{selectedActivity.avgPower} W</strong>
+            </article>
+          </div>
+
+          <div className="chart-grid">
+            <article className="chart-card">
+              <h3>Pace por tramo (seg/km)</h3>
+              <svg viewBox="0 0 360 120" role="img">
+                <path
+                  className="line line-pace"
+                  d={buildLinePath(selectedActivity.paceSeriesSecPerKm)}
+                  fill="none"
+                />
+              </svg>
+              <p>Promedio: {selectedActivity.avgPace}</p>
+            </article>
+
+            <article className="chart-card">
+              <h3>Frecuencia cardiaca</h3>
+              <svg viewBox="0 0 360 120" role="img">
+                <path className="line line-hr" d={buildLinePath(selectedActivity.hrSeries)} fill="none" />
+              </svg>
+              <p>Maxima: {selectedActivity.maxHr} ppm</p>
+            </article>
+
+            <article className="chart-card">
+              <h3>Perfil de elevacion</h3>
+              <svg viewBox="0 0 360 120" role="img">
+                <path
+                  className="line line-elevation"
+                  d={buildLinePath(selectedActivity.elevationSeries)}
+                  fill="none"
+                />
+              </svg>
+              <p>Desnivel positivo: {selectedActivity.elevationGainM} m</p>
+            </article>
+          </div>
+
+          <div className="notes">
+            <h3>Notas de sesion</h3>
+            <p>{selectedActivity.notes}</p>
+          </div>
+
+          <div className="analysis-card">
+            <div className="analysis-head">
+              <h3>Analisis IA</h3>
+              {analysis ? (
+                <span className="score-pill">Score {analysis.score}/100</span>
+              ) : (
+                <span className="score-pill score-pill--muted">Pendiente</span>
+              )}
+            </div>
+            {error ? <p className="error-message">{error}</p> : null}
+            {analysis ? (
+              <>
+                <p className="analysis-summary">{analysis.summary}</p>
+                <ul>
+                  {analysis.insights.map((insight) => (
+                    <li key={insight}>{insight}</li>
+                  ))}
+                </ul>
+                <p className="analysis-recommendation">{analysis.recommendation}</p>
+                <small>
+                  Motor: {analysis.source === "openai" ? analysis.model ?? "OpenAI" : "Fallback local"}
+                </small>
+              </>
+            ) : (
+              <p>
+                Pulsa <strong>Analizar con IA</strong> para obtener una lectura del entrenamiento y una
+                recomendacion concreta para la siguiente sesion.
+              </p>
+            )}
+          </div>
+        </section>
+      </section>
+
+      <section className="race-goals-grid">
+        <article className="panel race-panel">
+          <div className="panel-head">
+            <h2>Predicts de carrera</h2>
+            <span>Confianza {confidence}%</span>
+          </div>
+          <p className="panel-copy">
+            Estimacion basada en ritmo reciente, carga y tipo de sesion seleccionada.
+          </p>
+          <div className="predict-grid">
+            {predictions.map((prediction) => (
+              <div className="predict-card" key={prediction.label}>
+                <span>{prediction.label}</span>
+                <strong>{formatRaceTime(prediction.predictedSeconds)}</strong>
+                <small>{(prediction.predictedSeconds / prediction.distanceKm).toFixed(1)} seg/km</small>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel goals-panel">
+          <div className="panel-head">
+            <h2>Proximos objetivos</h2>
+            <span>{goals.length} activos</span>
+          </div>
+
+          <div className="goal-form goal-form-new">
+            <input
+              placeholder="Ej: Media maraton Bogota"
+              value={goalTitle}
+              onChange={(event) => setGoalTitle(event.target.value)}
+            />
+            <select value={goalType} onChange={(event) => setGoalType(event.target.value as GoalType)}>
+              <option value="weekly-km">Km semana</option>
+              <option value="weekly-load">Carga semanal</option>
+              <option value="10k-time">Tiempo 10K (seg)</option>
+            </select>
+            <input
+              placeholder="Meta"
+              type="number"
+              value={goalTarget}
+              onChange={(event) => setGoalTarget(event.target.value)}
+            />
+            <input type="date" value={goalDate} onChange={(event) => setGoalDate(event.target.value)} />
+            <input
+              placeholder="Carrera (opcional)"
+              value={raceName}
+              onChange={(event) => setRaceName(event.target.value)}
+            />
+            <input
+              placeholder="Distancia carrera km"
+              type="number"
+              value={raceDistanceKm}
+              onChange={(event) => setRaceDistanceKm(event.target.value)}
+            />
+            <button className="goal-add-button" type="button" onClick={addGoal} disabled={goalSaving}>
+              {goalSaving ? "Guardando..." : "Crear objetivo"}
+            </button>
+          </div>
+
+          {goalsError ? <p className="error-message">{goalsError}</p> : null}
+          {goalsLoading ? <p className="panel-copy">Cargando objetivos...</p> : null}
+
+          <div className="goals-list">
+            {goals.map((goal) => {
+              const progress = goalProgress(goal);
+              const isEditing = editingGoalId === goal.id && editDraft !== null;
+              return (
+                <div className={`goal-card${goal.status === "completed" ? " is-completed" : ""}`} key={goal.id}>
+                  <div className="goal-head">
+                    <div>
+                      <h3>{goal.title}</h3>
+                      <p>
+                        {goalTypeLabel[goal.type]} · objetivo {formatGoalTarget(goal)} · {goal.dueDate}
+                      </p>
+                      {goal.raceName ? (
+                        <p>
+                          Carrera: {goal.raceName}
+                          {goal.raceDistanceKm ? ` (${goal.raceDistanceKm} km)` : ""}
+                        </p>
+                      ) : null}
+                    </div>
+                    <div className="goal-actions">
+                      <span className={`goal-status-badge goal-status-${goal.status}`}>{statusLabel[goal.status]}</span>
+                      <button className="goal-remove" type="button" onClick={() => toggleGoalCompleted(goal)}>
+                        {goal.status === "completed" ? "Reabrir" : "Completar"}
+                      </button>
+                      <button className="goal-remove" type="button" onClick={() => startEditingGoal(goal)}>
+                        Editar
+                      </button>
+                      <button
+                        className="goal-remove"
+                        type="button"
+                        onClick={() => removeGoal(goal.id)}
+                        disabled={goalDeletingId === goal.id}
+                      >
+                        {goalDeletingId === goal.id ? "Quitando..." : "Quitar"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {isEditing ? (
+                    <div className="goal-form goal-form-edit">
+                      <input
+                        value={editDraft.title}
+                        onChange={(event) =>
+                          setEditDraft((current) => (current ? { ...current, title: event.target.value } : current))
+                        }
+                      />
+                      <select
+                        value={editDraft.type}
+                        onChange={(event) =>
+                          setEditDraft((current) =>
+                            current ? { ...current, type: event.target.value as GoalType } : current,
+                          )
+                        }
+                      >
+                        <option value="weekly-km">Km semana</option>
+                        <option value="weekly-load">Carga semanal</option>
+                        <option value="10k-time">Tiempo 10K (seg)</option>
+                      </select>
+                      <input
+                        type="number"
+                        value={editDraft.target}
+                        onChange={(event) =>
+                          setEditDraft((current) => (current ? { ...current, target: event.target.value } : current))
+                        }
+                      />
+                      <input
+                        type="date"
+                        value={editDraft.dueDate}
+                        onChange={(event) =>
+                          setEditDraft((current) => (current ? { ...current, dueDate: event.target.value } : current))
+                        }
+                      />
+                      <input
+                        placeholder="Carrera"
+                        value={editDraft.raceName}
+                        onChange={(event) =>
+                          setEditDraft((current) => (current ? { ...current, raceName: event.target.value } : current))
+                        }
+                      />
+                      <input
+                        type="number"
+                        placeholder="Km carrera"
+                        value={editDraft.raceDistanceKm}
+                        onChange={(event) =>
+                          setEditDraft((current) =>
+                            current ? { ...current, raceDistanceKm: event.target.value } : current,
+                          )
+                        }
+                      />
+                      <button className="goal-add-button" type="button" onClick={() => saveGoal(goal.id)}>
+                        Guardar
+                      </button>
+                      <button className="goal-cancel-button" type="button" onClick={cancelEditing}>
+                        Cancelar
+                      </button>
+                    </div>
+                  ) : null}
+
+                  <div className="goal-progress-track">
+                    <div
+                      className={`goal-progress-fill${progress >= 100 ? " is-good" : ""}`}
+                      style={{ width: `${Math.min(progress, 100)}%` }}
+                    />
+                  </div>
+                  <div className="goal-foot">
+                    <span>{goalProgressText(goal)}</span>
+                    <strong>{progress >= 100 ? "On track" : "Atencion"}</strong>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </article>
+      </section>
+
+      <section className="trend-grid">
+        <article className="panel trend-panel">
+          <div className="panel-head">
+            <h2>Tendencia semanal</h2>
+            <span>Ultimas 6 semanas</span>
+          </div>
+          <div className="bars">
+            {weeklyTrend.map((point) => (
+              <div className="bar-column" key={point.week}>
+                <div className="bar-stack">
+                  <span
+                    className="bar bar-distance"
+                    style={{ height: resolveBarHeight(point.distanceKm, maxDistance) }}
+                  />
+                  <span className="bar-label">{point.distanceKm} km</span>
+                </div>
+                <strong>{point.week}</strong>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel trend-panel">
+          <div className="panel-head">
+            <h2>Carga interna</h2>
+            <span>TSS / semana</span>
+          </div>
+          <div className="bars">
+            {weeklyTrend.map((point) => (
+              <div className="bar-column" key={`load-${point.week}`}>
+                <div className="bar-stack">
+                  <span className="bar bar-load" style={{ height: resolveBarHeight(point.load, maxLoad) }} />
+                  <span className="bar-label">{point.load}</span>
+                </div>
+                <strong>{point.week}</strong>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel trend-panel">
+          <div className="panel-head">
+            <h2>Zonas de FC</h2>
+            <span>Actividad seleccionada</span>
+          </div>
+          <div className="zones">
+            {selectedActivity.zoneDistribution.map((zone) => {
+              const totalMinutes = selectedActivity.zoneDistribution.reduce(
+                (accumulator, current) => accumulator + current.minutes,
+                0,
+              );
+              const percentage = totalMinutes > 0 ? Math.round((zone.minutes / totalMinutes) * 100) : 0;
+
+              return (
+                <div className="zone-row" key={zone.zone}>
+                  <span>{zone.zone}</span>
+                  <div className="zone-track">
+                    <div className="zone-fill" style={{ width: `${percentage}%` }} />
+                  </div>
+                  <strong>
+                    {zone.minutes} min ({percentage}%)
+                  </strong>
+                </div>
+              );
+            })}
+          </div>
+        </article>
+      </section>
+
+      <section className="split-table panel">
+        <div className="panel-head">
+          <h2>Splits por kilometro</h2>
+          <span>{selectedActivity.splitsKm.length} tramos</span>
+        </div>
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Km</th>
+                <th>Pace</th>
+                <th>Min/km</th>
+              </tr>
+            </thead>
+            <tbody>
+              {selectedActivity.splitsKm.map((split, index) => (
+                <tr key={`${selectedActivity.id}-${index + 1}`}>
+                  <td>{index + 1}</td>
+                  <td>{split}s</td>
+                  <td>{toMinutes(split)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  );
+}
+
