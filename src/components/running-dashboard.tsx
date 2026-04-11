@@ -3,12 +3,12 @@
 import { useEffect, useMemo, useState, useTransition } from "react";
 
 import {
-  dashboardStats,
-  latestActivityId,
-  runningActivities,
-  trainingTargets,
-  weeklyTrend,
+  dashboardStats as fallbackDashboardStats,
+  runningActivities as fallbackActivities,
+  trainingTargets as fallbackTrainingTargets,
+  weeklyTrend as fallbackWeeklyTrend,
 } from "@/lib/dashboard-data";
+import type { RunningActivity, WeeklyTrendPoint } from "@/lib/dashboard-data";
 
 type AnalyzeResponse = {
   summary: string;
@@ -76,6 +76,24 @@ type SyncApiResult = {
   retryAtUtc?: string | null;
   message?: string | null;
   quota?: StravaQuotaSnapshot | null;
+};
+
+type StatCard = {
+  label: string;
+  value: string;
+  helper: string;
+};
+
+type TrainingTarget = {
+  label: string;
+  value: string;
+};
+
+type ActivitiesApiResponse = {
+  activities?: RunningActivity[];
+  stats?: StatCard[];
+  weeklyTrend?: WeeklyTrendPoint[];
+  trainingTargets?: TrainingTarget[];
 };
 
 const sourceLabel = {
@@ -180,7 +198,13 @@ const statusLabel: Record<GoalStatus, string> = {
 };
 
 export function RunningDashboard() {
-  const [selectedId, setSelectedId] = useState<string>(latestActivityId);
+  const [activities, setActivities] = useState<RunningActivity[]>(fallbackActivities);
+  const [stats, setStats] = useState<StatCard[]>(fallbackDashboardStats);
+  const [trend, setTrend] = useState<WeeklyTrendPoint[]>(fallbackWeeklyTrend);
+  const [targets, setTargets] = useState<TrainingTarget[]>(fallbackTrainingTargets);
+  const [activitiesLoading, setActivitiesLoading] = useState(false);
+  const [activitiesError, setActivitiesError] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string>(fallbackActivities[0]?.id ?? "");
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
@@ -208,8 +232,8 @@ export function RunningDashboard() {
   const [raceDistanceKm, setRaceDistanceKm] = useState("");
 
   const selectedActivity = useMemo(() => {
-    return runningActivities.find((item) => item.id === selectedId) ?? runningActivities[0];
-  }, [selectedId]);
+    return activities.find((item) => item.id === selectedId) ?? activities[0] ?? fallbackActivities[0];
+  }, [activities, selectedId]);
 
   const updateQuotaMessage = (quota?: StravaQuotaSnapshot | null) => {
     if (!quota) {
@@ -253,6 +277,53 @@ export function RunningDashboard() {
     setAnalysis(null);
     setError(null);
   }, [selectedId]);
+
+  useEffect(() => {
+    let mounted = true;
+    const loadActivities = async () => {
+      setActivitiesLoading(true);
+      setActivitiesError(null);
+      try {
+        const response = await fetch("/api/activities");
+        if (!response.ok) throw new Error("No se pudieron cargar actividades reales.");
+        const payload = (await response.json()) as ActivitiesApiResponse;
+        if (!mounted) return;
+
+        const nextActivities =
+          Array.isArray(payload.activities) && payload.activities.length > 0
+            ? payload.activities
+            : fallbackActivities;
+        setActivities(nextActivities);
+        setStats(
+          Array.isArray(payload.stats) && payload.stats.length > 0 ? payload.stats : fallbackDashboardStats,
+        );
+        setTrend(
+          Array.isArray(payload.weeklyTrend) && payload.weeklyTrend.length > 0
+            ? payload.weeklyTrend
+            : fallbackWeeklyTrend,
+        );
+        setTargets(
+          Array.isArray(payload.trainingTargets) && payload.trainingTargets.length > 0
+            ? payload.trainingTargets
+            : fallbackTrainingTargets,
+        );
+
+        setSelectedId((current) =>
+          nextActivities.some((item) => item.id === current) ? current : (nextActivities[0]?.id ?? ""),
+        );
+      } catch (loadError) {
+        if (!mounted) return;
+        setActivitiesError(loadError instanceof Error ? loadError.message : "Error al cargar actividades.");
+      } finally {
+        if (mounted) setActivitiesLoading(false);
+      }
+    };
+
+    loadActivities();
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -353,9 +424,9 @@ export function RunningDashboard() {
     };
   }, []);
 
-  const maxDistance = Math.max(...weeklyTrend.map((item) => item.distanceKm));
-  const maxLoad = Math.max(...weeklyTrend.map((item) => item.load));
-  const latestWeek = weeklyTrend[weeklyTrend.length - 1];
+  const maxDistance = Math.max(...trend.map((item) => item.distanceKm));
+  const maxLoad = Math.max(...trend.map((item) => item.load));
+  const latestWeek = trend[trend.length - 1];
   const paceSec = paceToSeconds(selectedActivity.avgPace);
   const paceFactor = Math.max(0.92, Math.min(1.08, 1 + (selectedActivity.tss - 70) / 600));
 
@@ -687,9 +758,11 @@ export function RunningDashboard() {
           {stravaSyncMessage ? <p className="strava-sync-message">{stravaSyncMessage}</p> : null}
           {stravaHistoryMessage ? <p className="strava-sync-message">{stravaHistoryMessage}</p> : null}
           {stravaQuotaMessage ? <p className="strava-sync-message">{stravaQuotaMessage}</p> : null}
+          {activitiesLoading ? <p className="strava-sync-message">Cargando actividades reales...</p> : null}
+          {activitiesError ? <p className="error-message">{activitiesError}</p> : null}
         </div>
         <div className="header-badges">
-          {trainingTargets.map((target) => (
+          {targets.map((target) => (
             <article key={target.label} className="header-pill">
               <span>{target.label}</span>
               <strong>{target.value}</strong>
@@ -699,7 +772,7 @@ export function RunningDashboard() {
       </header>
 
       <section className="kpi-grid">
-        {dashboardStats.map((stat) => (
+        {stats.map((stat) => (
           <article key={stat.label} className="kpi-card">
             <span>{stat.label}</span>
             <strong>{stat.value}</strong>
@@ -712,11 +785,11 @@ export function RunningDashboard() {
         <aside className="panel activity-list-panel">
           <div className="panel-head">
             <h2>Actividades</h2>
-            <span>{runningActivities.length} sesiones</span>
+            <span>{activities.length} sesiones</span>
           </div>
 
           <div className="activity-list">
-            {runningActivities.map((activity) => {
+            {activities.map((activity) => {
               const isActive = activity.id === selectedActivity.id;
               return (
                 <button
@@ -1037,7 +1110,7 @@ export function RunningDashboard() {
             <span>Ultimas 6 semanas</span>
           </div>
           <div className="bars">
-            {weeklyTrend.map((point) => (
+            {trend.map((point) => (
               <div className="bar-column" key={point.week}>
                 <div className="bar-stack">
                   <span
@@ -1058,7 +1131,7 @@ export function RunningDashboard() {
             <span>TSS / semana</span>
           </div>
           <div className="bars">
-            {weeklyTrend.map((point) => (
+            {trend.map((point) => (
               <div className="bar-column" key={`load-${point.week}`}>
                 <div className="bar-stack">
                   <span className="bar bar-load" style={{ height: resolveBarHeight(point.load, maxLoad) }} />

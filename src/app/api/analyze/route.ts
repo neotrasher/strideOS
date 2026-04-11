@@ -1,9 +1,26 @@
 import { NextResponse } from "next/server";
 
 import { runningActivities } from "@/lib/dashboard-data";
+import { ensureDemoUser } from "@/lib/demo-user";
+import { prisma } from "@/lib/prisma";
 
 type AnalyzeRequest = {
   activityId?: string;
+};
+
+type AnalysisActivity = {
+  id: string;
+  title: string;
+  workoutType: string;
+  planTarget: string;
+  notes: string;
+  distanceKm: number;
+  avgPace: string;
+  avgHr: number;
+  maxHr: number;
+  cadence: number;
+  tss: number;
+  rpe: number;
 };
 
 const paceToSeconds = (pace: string) => {
@@ -12,8 +29,7 @@ const paceToSeconds = (pace: string) => {
   return min * 60 + sec;
 };
 
-const fallbackAnalysis = (activityId: string) => {
-  const activity = runningActivities.find((item) => item.id === activityId);
+const fallbackAnalysis = (activity: AnalysisActivity | null) => {
   if (!activity) {
     return {
       summary: "No encontramos la actividad solicitada.",
@@ -53,10 +69,85 @@ const fallbackAnalysis = (activityId: string) => {
   };
 };
 
+const secPerKmToPace = (secPerKm: number | null) => {
+  if (!secPerKm || secPerKm <= 0) return "0:00 /km";
+  const min = Math.floor(secPerKm / 60);
+  const sec = Math.round(secPerKm % 60);
+  return `${min}:${String(sec).padStart(2, "0")} /km`;
+};
+
+const mapDbActivityToInput = (activity: {
+  id: string;
+  name: string;
+  sport: string;
+  summary: string | null;
+  distanceM: number | null;
+  movingTimeS: number | null;
+  averageHr: number | null;
+  maxHr: number | null;
+  averageCadence: number | null;
+  averagePaceSecondsKm: number | null;
+  rpe: number | null;
+  rawPayload: unknown;
+}): AnalysisActivity => {
+  const detail = (activity.rawPayload &&
+  typeof activity.rawPayload === "object" &&
+  !Array.isArray(activity.rawPayload) &&
+  typeof (activity.rawPayload as { detail?: unknown }).detail === "object")
+    ? ((activity.rawPayload as { detail?: Record<string, unknown> }).detail ?? null)
+    : null;
+
+  const sufferScoreRaw = detail && typeof detail.suffer_score === "number" ? detail.suffer_score : null;
+  const distanceKm = (activity.distanceM ?? 0) / 1000;
+  const paceSec =
+    activity.averagePaceSecondsKm ??
+    ((activity.movingTimeS ?? 0) > 0 && distanceKm > 0 ? (activity.movingTimeS ?? 0) / distanceKm : null);
+  const tss =
+    sufferScoreRaw !== null ? Math.round(sufferScoreRaw) : Math.max(10, Math.round(((activity.movingTimeS ?? 0) / 60) * 1.2));
+
+  return {
+    id: activity.id,
+    title: activity.name,
+    workoutType: activity.sport.replaceAll("_", " "),
+    planTarget: `Sesion ${activity.sport === "RUN" ? "running" : "cardio"} de ${distanceKm.toFixed(1)} km.`,
+    notes: activity.summary ?? "Sin notas.",
+    distanceKm: Math.round(distanceKm * 10) / 10,
+    avgPace: secPerKmToPace(paceSec ? Math.round(paceSec) : null),
+    avgHr: activity.averageHr ?? 0,
+    maxHr: activity.maxHr ?? 0,
+    cadence: Math.round(activity.averageCadence ?? 0),
+    tss,
+    rpe: activity.rpe ?? Math.min(10, Math.max(2, Math.round(tss / 12))),
+  };
+};
+
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as AnalyzeRequest;
   const activityId = body.activityId ?? "";
-  const activity = runningActivities.find((item) => item.id === activityId);
+  const user = await ensureDemoUser();
+
+  const dbActivity = await prisma.activity.findFirst({
+    where: {
+      id: activityId,
+      userId: user.id,
+    },
+    select: {
+      id: true,
+      name: true,
+      sport: true,
+      summary: true,
+      distanceM: true,
+      movingTimeS: true,
+      averageHr: true,
+      maxHr: true,
+      averageCadence: true,
+      averagePaceSecondsKm: true,
+      rpe: true,
+      rawPayload: true,
+    },
+  });
+  const mockActivity = runningActivities.find((item) => item.id === activityId);
+  const activity = dbActivity ? mapDbActivityToInput(dbActivity) : (mockActivity ?? null);
 
   if (!activity) {
     return NextResponse.json({ error: "Actividad no encontrada" }, { status: 404 });
@@ -64,7 +155,7 @@ export async function POST(request: Request) {
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json(fallbackAnalysis(activity.id));
+    return NextResponse.json(fallbackAnalysis(activity));
   }
 
   try {
@@ -113,7 +204,7 @@ export async function POST(request: Request) {
     });
 
     if (!aiResponse.ok) {
-      return NextResponse.json(fallbackAnalysis(activity.id));
+      return NextResponse.json(fallbackAnalysis(activity));
     }
 
     const payload = (await aiResponse.json()) as {
@@ -141,6 +232,6 @@ export async function POST(request: Request) {
       model,
     });
   } catch {
-    return NextResponse.json(fallbackAnalysis(activity.id));
+    return NextResponse.json(fallbackAnalysis(activity));
   }
 }
