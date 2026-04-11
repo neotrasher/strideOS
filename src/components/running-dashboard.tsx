@@ -241,7 +241,7 @@ export function RunningDashboard() {
       return;
     }
     setStravaQuotaMessage(
-      `Cuota Strava - 15min: gen ${quota.general.quarterHour.used}/${quota.general.quarterHour.limit}, lectura ${quota.read.quarterHour.used}/${quota.read.quarterHour.limit}. Diario: gen ${quota.general.daily.used}/${quota.general.daily.limit}, lectura ${quota.read.daily.used}/${quota.read.daily.limit}.`,
+      `Cuota: 15m gen ${quota.general.quarterHour.used}/${quota.general.quarterHour.limit} · lec ${quota.read.quarterHour.used}/${quota.read.quarterHour.limit} | dia gen ${quota.general.daily.used}/${quota.general.daily.limit} · lec ${quota.read.daily.used}/${quota.read.daily.limit}`,
     );
   };
 
@@ -261,9 +261,7 @@ export function RunningDashboard() {
       if (payload.history?.totalActivities && payload.history.totalActivities > 0) {
         const oldest = payload.history.oldestStartedAt ? formatDateShort(payload.history.oldestStartedAt) : "?";
         const newest = payload.history.newestStartedAt ? formatDateShort(payload.history.newestStartedAt) : "?";
-        setStravaHistoryMessage(
-          `Historial sincronizado: ${payload.history.totalActivities} actividades (${oldest} -> ${newest}).`,
-        );
+        setStravaHistoryMessage(`Historial: ${payload.history.totalActivities} actividades (${oldest} a ${newest})`);
       } else {
         setStravaHistoryMessage("Aun no hay historial sincronizado.");
       }
@@ -755,9 +753,15 @@ export function RunningDashboard() {
               />
             ) : null}
           </div>
-          {stravaSyncMessage ? <p className="strava-sync-message">{stravaSyncMessage}</p> : null}
-          {stravaHistoryMessage ? <p className="strava-sync-message">{stravaHistoryMessage}</p> : null}
-          {stravaQuotaMessage ? <p className="strava-sync-message">{stravaQuotaMessage}</p> : null}
+          <div className="strava-meta">
+            {stravaSyncMessage ? <p className="strava-sync-message">{stravaSyncMessage}</p> : null}
+            {stravaHistoryMessage ? (
+              <p className="strava-sync-message strava-sync-message-soft">{stravaHistoryMessage}</p>
+            ) : null}
+            {stravaQuotaMessage ? (
+              <p className="strava-sync-message strava-sync-message-soft">{stravaQuotaMessage}</p>
+            ) : null}
+          </div>
           {activitiesLoading ? <p className="strava-sync-message">Cargando actividades reales...</p> : null}
           {activitiesError ? <p className="error-message">{activitiesError}</p> : null}
         </div>
