@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useEffect, useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition, type MouseEvent } from "react";
 
 import {
   dashboardStats as fallbackDashboardStats,
@@ -179,27 +179,6 @@ const getWeekLabel = (weekKey: string) => {
   return `Semana ${week} · ${year}`;
 };
 
-const buildLinePath = (values: number[], width = 360, height = 120) => {
-  if (values.length === 0) return "";
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min || 1;
-
-  return values
-    .map((value, index) => {
-      const x = (index / (values.length - 1 || 1)) * width;
-      const normalized = (value - min) / range;
-      const y = height - normalized * height;
-      return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
-    })
-    .join(" ");
-};
-
-const bestAndWorst = (values: number[]) => {
-  if (values.length === 0) return { best: null as number | null, worst: null as number | null };
-  return { best: Math.min(...values), worst: Math.max(...values) };
-};
-
 const resolveBarHeight = (value: number, max: number) => {
   if (max <= 0) return "8%";
   return `${Math.max(8, Math.round((value / max) * 100))}%`;
@@ -216,6 +195,13 @@ const formatRaceTime = (totalSeconds: number) => {
   const seconds = Math.round(totalSeconds % 60);
   if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+};
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const riegelTime = (baseDistanceKm: number, baseSeconds: number, targetDistanceKm: number, exponent = 1.06) => {
+  if (baseDistanceKm <= 0 || baseSeconds <= 0 || targetDistanceKm <= 0) return 0;
+  return baseSeconds * Math.pow(targetDistanceKm / baseDistanceKm, exponent);
 };
 
 const formatGoalTarget = (goal: Goal) => {
@@ -257,6 +243,8 @@ export function RunningDashboard() {
   const [backfillFromDate, setBackfillFromDate] = useState("");
   const [weekCursor, setWeekCursor] = useState(0);
   const [sessionMetric, setSessionMetric] = useState<SessionMetricKey>("pace");
+  const [hoveredKm, setHoveredKm] = useState<number | null>(null);
+  const chartRef = useRef<SVGSVGElement | null>(null);
 
   const [goalTitle, setGoalTitle] = useState("");
   const [goalType, setGoalType] = useState<GoalType>("weekly-km");
@@ -330,7 +318,12 @@ export function RunningDashboard() {
   useEffect(() => {
     setAnalysis(null);
     setError(null);
+    setHoveredKm(null);
   }, [selectedId]);
+
+  useEffect(() => {
+    setHoveredKm(null);
+  }, [sessionMetric]);
 
   useEffect(() => {
     setWeekCursor(0);
@@ -495,6 +488,53 @@ export function RunningDashboard() {
   const paceSec = paceToSeconds(selectedActivity.avgPace);
   const paceFactor = Math.max(0.92, Math.min(1.08, 1 + (selectedActivity.tss - 70) / 600));
 
+  const recentRunActivities = useMemo(
+    () =>
+      activities
+        .filter((activity) => activity.distanceKm >= 3 && activity.movingTimeMin >= 15)
+        .slice(0, 12),
+    [activities],
+  );
+
+  const baselinePerformance = useMemo(() => {
+    if (recentRunActivities.length === 0) {
+      const baseDistance = Math.max(5, selectedActivity.distanceKm);
+      const baseSeconds = paceSec * baseDistance;
+      return { baseDistanceKm: baseDistance, baseSeconds, volatility: 0.12 };
+    }
+
+    const weighted = recentRunActivities.map((activity, index) => {
+      const recencyWeight = 1 - index * 0.06;
+      const distanceWeight = clamp(activity.distanceKm / 12, 0.45, 1.35);
+      const weight = clamp(recencyWeight * distanceWeight, 0.2, 1.5);
+      return {
+        weight,
+        distanceKm: activity.distanceKm,
+        seconds: activity.movingTimeMin * 60,
+      };
+    });
+
+    const totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0) || 1;
+    const eq10kSeconds = weighted.reduce((sum, item) => {
+      const eq = riegelTime(item.distanceKm, item.seconds, 10, 1.06);
+      return sum + eq * item.weight;
+    }, 0) / totalWeight;
+
+    const avgEq = eq10kSeconds;
+    const variance =
+      weighted.reduce((sum, item) => {
+        const eq = riegelTime(item.distanceKm, item.seconds, 10, 1.06);
+        return sum + item.weight * Math.pow(eq - avgEq, 2);
+      }, 0) / totalWeight;
+    const volatility = Math.sqrt(Math.max(0, variance)) / Math.max(1, avgEq);
+
+    return {
+      baseDistanceKm: 10,
+      baseSeconds: avgEq,
+      volatility,
+    };
+  }, [paceSec, recentRunActivities, selectedActivity.distanceKm]);
+
   const predictions: RacePredict[] = useMemo(() => {
     const distances = [
       { label: "5K", distanceKm: 5 },
@@ -503,18 +543,29 @@ export function RunningDashboard() {
       { label: "42K", distanceKm: 42.195 },
     ];
 
-    return distances.map((item) => {
-      const base = paceSec * item.distanceKm;
-      const multiplier = item.distanceKm <= 10 ? 0.99 : item.distanceKm <= 21.097 ? 1.04 : 1.11;
-      return {
-        label: item.label,
-        distanceKm: item.distanceKm,
-        predictedSeconds: Math.round(base * multiplier * paceFactor),
-      };
-    });
-  }, [paceFactor, paceSec]);
+    return distances.map((item) => ({
+      label: item.label,
+      distanceKm: item.distanceKm,
+      predictedSeconds: Math.round(
+        riegelTime(
+          baselinePerformance.baseDistanceKm,
+          baselinePerformance.baseSeconds,
+          item.distanceKm,
+          1.06,
+        ),
+      ),
+    }));
+  }, [baselinePerformance.baseDistanceKm, baselinePerformance.baseSeconds]);
 
-  const confidence = Math.max(62, Math.min(93, 90 - Math.abs(selectedActivity.rpe - 7) * 3));
+  const confidence = clamp(
+    Math.round(
+      92 -
+        baselinePerformance.volatility * 140 -
+        Math.max(0, 8 - recentRunActivities.length) * 2.8,
+    ),
+    58,
+    92,
+  );
 
   const paceSplits = selectedActivity.splitsKm.length > 0 ? selectedActivity.splitsKm : selectedActivity.paceSeriesSecPerKm;
   const hrSplits = (selectedActivity.splitHr && selectedActivity.splitHr.length > 0) ? selectedActivity.splitHr : selectedActivity.hrSeries;
@@ -535,6 +586,7 @@ export function RunningDashboard() {
         title: "Ritmo por km",
         colorClass: "session-line-pace",
         yLabel: "min/km",
+        invertScale: true,
         summary: `Promedio ${selectedActivity.avgPace}`,
         formatValue: (value: number) => `${formatPaceFromSeconds(value)} min/km`,
       };
@@ -544,6 +596,7 @@ export function RunningDashboard() {
         title: "Frecuencia cardiaca por km",
         colorClass: "session-line-hr",
         yLabel: "ppm",
+        invertScale: false,
         summary: `Media ${selectedActivity.avgHr} ppm · Max ${selectedActivity.maxHr} ppm`,
         formatValue: (value: number) => `${Math.round(value)} ppm`,
       };
@@ -552,10 +605,48 @@ export function RunningDashboard() {
       title: "Elevacion acumulada por km",
       colorClass: "session-line-elevation",
       yLabel: "m",
+      invertScale: false,
       summary: `Desnivel positivo ${selectedActivity.elevationGainM} m`,
       formatValue: (value: number) => `${Math.round(value)} m`,
     };
   }, [selectedActivity.avgHr, selectedActivity.avgPace, selectedActivity.elevationGainM, selectedActivity.maxHr, sessionMetric]);
+
+  const chartGeometry = useMemo(() => {
+    const width = 700;
+    const height = 200;
+    const padTop = 20;
+    const padBottom = 28;
+    const padLeft = 10;
+    const padRight = 10;
+    const plotWidth = width - padLeft - padRight;
+    const plotHeight = height - padTop - padBottom;
+    const values = sessionSeries;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const range = max - min || 1;
+
+    const points = values.map((value, index) => {
+      const x = padLeft + (index / Math.max(1, values.length - 1)) * plotWidth;
+      const norm = (value - min) / range;
+      const scaled = sessionMetricMeta.invertScale ? 1 - norm : norm;
+      const y = padTop + (1 - scaled) * plotHeight;
+      return { x, y, value, km: index + 1 };
+    });
+
+    const linePath = points
+      .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+      .join(" ");
+
+    const areaPath =
+      points.length > 1
+        ? `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${(padTop + plotHeight).toFixed(2)} L ${points[0].x.toFixed(2)} ${(padTop + plotHeight).toFixed(2)} Z`
+        : "";
+
+    return { width, height, padTop, padBottom, padLeft, padRight, plotWidth, plotHeight, points, linePath, areaPath };
+  }, [sessionMetricMeta.invertScale, sessionSeries]);
+
+  const hoveredPoint =
+    hoveredKm !== null ? chartGeometry.points[clamp(hoveredKm, 0, chartGeometry.points.length - 1)] ?? null : null;
 
   const goalProgress = (goal: Goal) => {
     if (goal.type === "weekly-km") {
@@ -816,6 +907,17 @@ export function RunningDashboard() {
     });
   };
 
+  const handleChartMove = (event: MouseEvent<SVGSVGElement>) => {
+    if (!chartRef.current || chartGeometry.points.length === 0) return;
+    const rect = chartRef.current.getBoundingClientRect();
+    const x = event.clientX - rect.left - chartGeometry.padLeft;
+    const ratio = clamp(x / Math.max(1, chartGeometry.plotWidth), 0, 1);
+    const index = Math.round(ratio * (chartGeometry.points.length - 1));
+    setHoveredKm(index);
+  };
+
+  const handleChartLeave = () => setHoveredKm(null);
+
   return (
     <main className="dashboard-shell">
       <header className="dashboard-header">
@@ -1015,12 +1117,38 @@ export function RunningDashboard() {
 
             {sessionSeries.length > 1 ? (
               <>
-                <svg className="session-chart" viewBox="0 0 700 200" role="img">
+                <svg
+                  ref={chartRef}
+                  className="session-chart"
+                  viewBox={`0 0 ${chartGeometry.width} ${chartGeometry.height}`}
+                  role="img"
+                  onMouseMove={handleChartMove}
+                  onMouseLeave={handleChartLeave}
+                >
+                  <defs>
+                    <linearGradient id="session-fill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="rgba(114, 210, 255, 0.26)" />
+                      <stop offset="100%" stopColor="rgba(114, 210, 255, 0.02)" />
+                    </linearGradient>
+                  </defs>
+                  <path className="session-area" d={chartGeometry.areaPath} fill="url(#session-fill)" />
                   <path
                     className={`session-line ${sessionMetricMeta.colorClass}`}
-                    d={buildLinePath(sessionSeries, 700, 180)}
+                    d={chartGeometry.linePath}
                     fill="none"
                   />
+                  {hoveredPoint ? (
+                    <>
+                      <line
+                        className="session-cursor-line"
+                        x1={hoveredPoint.x}
+                        y1={chartGeometry.padTop}
+                        x2={hoveredPoint.x}
+                        y2={chartGeometry.height - chartGeometry.padBottom}
+                      />
+                      <circle className="session-cursor-dot" cx={hoveredPoint.x} cy={hoveredPoint.y} r={5} />
+                    </>
+                  ) : null}
                 </svg>
                 <div className="session-axis">
                   <span>Km 1</span>
@@ -1028,6 +1156,13 @@ export function RunningDashboard() {
                   <span>Km {sessionSeries.length}</span>
                 </div>
                 <p className="session-summary">{sessionMetricMeta.summary}</p>
+                {hoveredPoint ? (
+                  <div className="session-tooltip">
+                    <strong>Km {hoveredPoint.km}</strong>
+                    <span>{sessionMetricMeta.formatValue(hoveredPoint.value)}</span>
+                    <small>Fuente: {selectedActivity.seriesSource ?? "summary"}</small>
+                  </div>
+                ) : null}
                 <div className="session-splits-row">
                   {sessionSeries.slice(0, 16).map((value, index) => (
                     <span key={`${selectedActivity.id}-metric-${sessionMetric}-${index + 1}`}>
@@ -1086,17 +1221,20 @@ export function RunningDashboard() {
             <span>Confianza {confidence}%</span>
           </div>
           <p className="panel-copy">
-            Estimacion basada en ritmo reciente, carga y tipo de sesion seleccionada.
+            Basado en tus ultimas {recentRunActivities.length} sesiones utiles y escalado con modelo de fatiga.
           </p>
           <div className="predict-grid">
             {predictions.map((prediction) => (
               <div className="predict-card" key={prediction.label}>
                 <span>{prediction.label}</span>
                 <strong>{formatRaceTime(prediction.predictedSeconds)}</strong>
-                <small>{(prediction.predictedSeconds / prediction.distanceKm).toFixed(1)} seg/km</small>
+                <small>{formatPaceFromSeconds(prediction.predictedSeconds / prediction.distanceKm)} min/km</small>
               </div>
             ))}
           </div>
+          <p className="panel-copy">
+            Base equivalente 10K: {formatRaceTime(Math.round(baselinePerformance.baseSeconds))}.
+          </p>
         </article>
 
         <article className="panel goals-panel">

@@ -549,12 +549,17 @@ p {
   height: 220px;
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.02);
+  cursor: crosshair;
 }
 
 .session-line {
   stroke-width: 3;
   stroke-linejoin: round;
   stroke-linecap: round;
+}
+
+.session-area {
+  opacity: 0.9;
 }
 
 .session-line-pace {
@@ -569,6 +574,18 @@ p {
   stroke: #ffd27d;
 }
 
+.session-cursor-line {
+  stroke: rgba(190, 212, 255, 0.45);
+  stroke-width: 1.4;
+  stroke-dasharray: 4 5;
+}
+
+.session-cursor-dot {
+  fill: #e9f4ff;
+  stroke: #5ca5ff;
+  stroke-width: 2;
+}
+
 .session-axis {
   display: flex;
   justify-content: space-between;
@@ -580,6 +597,31 @@ p {
 .session-summary {
   color: var(--muted);
   font-size: 0.9rem;
+}
+
+.session-tooltip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  width: fit-content;
+  border: 1px solid rgba(154, 193, 255, 0.24);
+  border-radius: 10px;
+  background: rgba(9, 16, 30, 0.9);
+  padding: 6px 10px;
+}
+
+.session-tooltip strong {
+  font-size: 0.8rem;
+}
+
+.session-tooltip span {
+  color: var(--text);
+  font-size: 0.84rem;
+}
+
+.session-tooltip small {
+  color: var(--muted);
+  font-size: 0.72rem;
 }
 
 .session-splits-row {
