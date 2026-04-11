@@ -435,6 +435,48 @@ p {
   background: rgba(255, 255, 255, 0.02);
 }
 
+.split-bars {
+  margin-top: 10px;
+  height: 120px;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(20px, 1fr);
+  gap: 6px;
+  align-items: end;
+  border-radius: 10px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.split-bar-col {
+  display: grid;
+  justify-items: center;
+  align-items: end;
+  height: 100%;
+  gap: 4px;
+}
+
+.split-bar-col small {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.split-bar {
+  width: 100%;
+  border-radius: 6px 6px 3px 3px;
+  background: linear-gradient(180deg, #74e2cf, #39d7b8);
+}
+
+.split-bar-hr {
+  background: linear-gradient(180deg, #ff95cf, #ff78c2);
+}
+
+.split-bar-elevation {
+  background: linear-gradient(180deg, #ffd27d, #ffbe58);
+}
+
 .line {
   stroke-width: 3.2;
   stroke-linecap: round;

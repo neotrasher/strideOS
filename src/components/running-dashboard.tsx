@@ -186,6 +186,11 @@ const buildLinePath = (values: number[], width = 360, height = 120) => {
     .join(" ");
 };
 
+const bestAndWorst = (values: number[]) => {
+  if (values.length === 0) return { best: null as number | null, worst: null as number | null };
+  return { best: Math.min(...values), worst: Math.max(...values) };
+};
+
 const resolveBarHeight = (value: number, max: number) => {
   if (max <= 0) return "8%";
   return `${Math.max(8, Math.round((value / max) * 100))}%`;
@@ -931,35 +936,81 @@ export function RunningDashboard() {
 
           <div className="chart-grid">
             <article className="chart-card">
-              <h3>Pace por tramo (seg/km)</h3>
-              <svg viewBox="0 0 360 120" role="img">
-                <path
-                  className="line line-pace"
-                  d={buildLinePath(selectedActivity.paceSeriesSecPerKm)}
-                  fill="none"
-                />
-              </svg>
-              <p>Promedio: {selectedActivity.avgPace}</p>
+              <h3>Pace por kilometro (real)</h3>
+              <div className="split-bars">
+                {selectedActivity.splitsKm.slice(0, 24).map((split, index) => {
+                  const min = Math.min(...selectedActivity.splitsKm);
+                  const max = Math.max(...selectedActivity.splitsKm);
+                  const range = max - min || 1;
+                  const score = 1 - (split - min) / range;
+                  const height = `${Math.max(16, Math.round(20 + score * 80))}%`;
+                  return (
+                    <div className="split-bar-col" key={`${selectedActivity.id}-pace-${index + 1}`}>
+                      <span className="split-bar" style={{ height }} />
+                      <small>{index + 1}</small>
+                    </div>
+                  );
+                })}
+              </div>
+              <p>
+                {(() => {
+                  const bw = bestAndWorst(selectedActivity.splitsKm);
+                  return bw.best && bw.worst
+                    ? `Mejor: ${toMinutes(bw.best)} min/km · Peor: ${toMinutes(bw.worst)} min/km`
+                    : `Promedio: ${selectedActivity.avgPace}`;
+                })()}
+              </p>
             </article>
 
             <article className="chart-card">
-              <h3>Frecuencia cardiaca</h3>
-              <svg viewBox="0 0 360 120" role="img">
-                <path className="line line-hr" d={buildLinePath(selectedActivity.hrSeries)} fill="none" />
-              </svg>
-              <p>Maxima: {selectedActivity.maxHr} ppm</p>
+              <h3>FC por kilometro</h3>
+              {selectedActivity.splitHr && selectedActivity.splitHr.length > 0 ? (
+                <>
+                  <div className="split-bars">
+                    {selectedActivity.splitHr.slice(0, 24).map((hr, index) => {
+                      const min = Math.min(...(selectedActivity.splitHr ?? [hr]));
+                      const max = Math.max(...(selectedActivity.splitHr ?? [hr]));
+                      const range = max - min || 1;
+                      const score = (hr - min) / range;
+                      const height = `${Math.max(16, Math.round(20 + score * 80))}%`;
+                      return (
+                        <div className="split-bar-col" key={`${selectedActivity.id}-hr-${index + 1}`}>
+                          <span className="split-bar split-bar-hr" style={{ height }} />
+                          <small>{index + 1}</small>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p>
+                    Promedio: {Math.round((selectedActivity.splitHr.reduce((a, b) => a + b, 0) / selectedActivity.splitHr.length) || 0)} ppm · Maxima: {selectedActivity.maxHr} ppm
+                  </p>
+                </>
+              ) : (
+                <p>Sin datos por tramo de FC para esta actividad.</p>
+              )}
             </article>
 
             <article className="chart-card">
-              <h3>Perfil de elevacion</h3>
-              <svg viewBox="0 0 360 120" role="img">
-                <path
-                  className="line line-elevation"
-                  d={buildLinePath(selectedActivity.elevationSeries)}
-                  fill="none"
-                />
-              </svg>
-              <p>Desnivel positivo: {selectedActivity.elevationGainM} m</p>
+              <h3>Elevacion acumulada por km</h3>
+              {selectedActivity.splitElevation && selectedActivity.splitElevation.length > 0 ? (
+                <>
+                  <div className="split-bars">
+                    {selectedActivity.splitElevation.slice(0, 24).map((elev, index) => {
+                      const max = Math.max(...(selectedActivity.splitElevation ?? [elev]), 1);
+                      const height = `${Math.max(8, Math.round((elev / max) * 100))}%`;
+                      return (
+                        <div className="split-bar-col" key={`${selectedActivity.id}-elev-${index + 1}`}>
+                          <span className="split-bar split-bar-elevation" style={{ height }} />
+                          <small>{index + 1}</small>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p>Desnivel positivo: {selectedActivity.elevationGainM} m</p>
+                </>
+              ) : (
+                <p>Sin perfil de elevacion por tramo para esta actividad.</p>
+              )}
             </article>
           </div>
 

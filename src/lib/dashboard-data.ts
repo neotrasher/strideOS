@@ -8,6 +8,7 @@ export type ZoneShare = {
 export type RunningActivity = {
   id: string;
   source: ActivitySource;
+  seriesSource?: "streams" | "splits" | "summary";
   title: string;
   date: string;
   workoutType: string;
@@ -25,6 +26,8 @@ export type RunningActivity = {
   tss: number;
   rpe: number;
   splitsKm: number[];
+  splitHr?: number[];
+  splitElevation?: number[];
   paceSeriesSecPerKm: number[];
   hrSeries: number[];
   elevationSeries: number[];
@@ -157,4 +160,3 @@ export const trainingTargets = [
   { label: "FC umbral", value: "162 - 170 ppm" },
   { label: "Volumen semana", value: "68 km" },
 ];
-

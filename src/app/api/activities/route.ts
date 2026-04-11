@@ -257,10 +257,19 @@ const mapActivity = (activity: {
   const zoneDistribution = buildZoneDistribution(hrSeries, avgHr || 0);
   const description = typeof detail?.description === "string" ? detail.description : null;
   const estimatedSplitCount = Math.max(1, Math.min(24, Math.round(distanceKm)));
+  const splitCount = splitPaceValues.length > 0 ? splitPaceValues.length : estimatedSplitCount;
+  const derivedSplitHr =
+    splitHrValues.length > 0 ? splitHrValues : sampleArray(hrSeries, splitCount, Math.round(avgHr || 140));
+  const derivedSplitElevation =
+    splitElevationProfile.length > 0 ? splitElevationProfile : sampleArray(elevationSeries, splitCount, 0);
+  const hasStreams = paceStream.length > 0 || hrStream.length > 0 || elevationStream.length > 0;
+  const hasSplits = splitPaceValues.length > 0 || splitHrValues.length > 0 || splitElevationProfile.length > 0;
+  const seriesSource: "streams" | "splits" | "summary" = hasStreams ? "streams" : hasSplits ? "splits" : "summary";
 
   return {
     id: activity.id,
     source: activity.source === ActivitySource.STRAVA ? "strava" : "garmin",
+    seriesSource,
     title: activity.name,
     date: activity.startedAt.toISOString(),
     workoutType,
@@ -281,6 +290,8 @@ const mapActivity = (activity: {
       splitPaceValues.length > 0
         ? splitPaceValues
         : sampleArray(paceSeries, estimatedSplitCount, paceSeries[0]),
+    splitHr: derivedSplitHr,
+    splitElevation: derivedSplitElevation,
     paceSeriesSecPerKm: paceSeries,
     hrSeries,
     elevationSeries,
