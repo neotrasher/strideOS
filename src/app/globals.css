@@ -221,8 +221,9 @@ p {
 
 .content-grid {
   display: grid;
-  grid-template-columns: 0.32fr 0.68fr;
+  grid-template-columns: minmax(300px, 0.36fr) minmax(0, 0.64fr);
   gap: 14px;
+  align-items: start;
 }
 
 .activity-list-panel {
@@ -230,6 +231,11 @@ p {
   display: grid;
   gap: 12px;
   align-content: start;
+  max-height: 78vh;
+  overflow: hidden;
+  position: sticky;
+  top: 14px;
+  align-self: start;
 }
 
 .panel-head {
@@ -251,6 +257,8 @@ p {
 .activity-list {
   display: grid;
   gap: 10px;
+  overflow: auto;
+  padding-right: 6px;
 }
 
 .activity-item {
@@ -321,6 +329,7 @@ p {
   padding: 16px;
   display: grid;
   gap: 14px;
+  align-self: start;
 }
 
 .detail-panel .panel-head p {
@@ -433,6 +442,9 @@ p {
   margin-top: 8px;
   color: var(--muted);
   line-height: 1.55;
+  max-height: 5.1em;
+  overflow: auto;
+  padding-right: 6px;
 }
 
 .analysis-card {
@@ -825,6 +837,11 @@ td {
 
   .kpi-grid {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .activity-list-panel {
+    position: static;
+    max-height: none;
   }
 }
 

@@ -23,6 +23,15 @@ const toNumberArray = (value: unknown): number[] => {
   return value.map((item) => Number(item)).filter((item) => Number.isFinite(item));
 };
 
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const trimText = (value: string | null | undefined, max = 220) => {
+  if (!value) return null;
+  const clean = value.replace(/\s+/g, " ").trim();
+  if (clean.length <= max) return clean;
+  return `${clean.slice(0, max - 1)}…`;
+};
+
 const sampleArray = (values: number[], points = SAMPLE_POINTS, fallbackValue = 0): number[] => {
   if (values.length === 0) return Array.from({ length: points }, () => fallbackValue);
   if (values.length === points) return values.map((value) => Math.round(value));
@@ -33,6 +42,13 @@ const sampleArray = (values: number[], points = SAMPLE_POINTS, fallbackValue = 0
     return Math.round(value);
   });
 };
+
+const synthSeries = (base: number, points: number, amplitude: number) =>
+  Array.from({ length: points }, (_, index) => {
+    const waveA = Math.sin((index / Math.max(1, points - 1)) * Math.PI * 1.8);
+    const waveB = Math.sin((index / Math.max(1, points - 1)) * Math.PI * 3.2);
+    return Math.round(base + waveA * amplitude + waveB * (amplitude * 0.45));
+  });
 
 const secPerKmToPace = (secPerKm: number | null) => {
   if (!secPerKm || secPerKm <= 0) return "0:00 /km";
@@ -187,9 +203,25 @@ const mapActivity = (activity: {
     .map((speed) => (speed > 0 ? 1000 / speed : 0))
     .filter((item) => Number.isFinite(item) && item > 0);
 
-  const paceSeries = sampleArray(paceStream, SAMPLE_POINTS, avgPaceSec ? Math.round(avgPaceSec) : 300);
-  const hrSeries = sampleArray(hrStream, SAMPLE_POINTS, avgHr || 140);
-  const elevationSeries = sampleArray(elevationStream, SAMPLE_POINTS, Math.round(activity.elevationGainM ?? 0));
+  const paceSeriesFromSplits =
+    splitValues.length > 0 ? sampleArray(splitValues, SAMPLE_POINTS, splitValues[0] ?? 300) : [];
+
+  const paceSeries =
+    paceStream.length > 0
+      ? sampleArray(paceStream, SAMPLE_POINTS, avgPaceSec ? Math.round(avgPaceSec) : 300)
+      : paceSeriesFromSplits.length > 0
+        ? paceSeriesFromSplits
+        : synthSeries(Math.round(avgPaceSec ?? 300), SAMPLE_POINTS, 10);
+
+  const hrSeries =
+    hrStream.length > 0
+      ? sampleArray(hrStream, SAMPLE_POINTS, avgHr || 140)
+      : synthSeries(avgHr || 142, SAMPLE_POINTS, clamp(((maxHr || avgHr || 150) - (avgHr || 140)) / 2, 4, 14));
+
+  const elevationSeries =
+    elevationStream.length > 0
+      ? sampleArray(elevationStream, SAMPLE_POINTS, Math.round(activity.elevationGainM ?? 0))
+      : synthSeries(clamp(Math.round((activity.elevationGainM ?? 50) / 3), 8, 65), SAMPLE_POINTS, 7);
 
   const workoutType = mapWorkoutType(activity.sport);
   const zoneDistribution = buildZoneDistribution(hrSeries, avgHr || 0);
@@ -203,7 +235,7 @@ const mapActivity = (activity: {
     date: activity.startedAt.toISOString(),
     workoutType,
     planTarget: mapPlanTarget(workoutType, distanceKm, avgPace),
-    notes: activity.summary ?? description ?? "Sin notas adicionales.",
+    notes: trimText(activity.summary) ?? trimText(description, 260) ?? "Sin notas adicionales.",
     distanceKm: Math.round(distanceKm * 10) / 10,
     movingTimeMin,
     elapsedTimeMin,
@@ -232,6 +264,7 @@ export async function GET() {
     where: {
       userId: user.id,
       source: { in: [ActivitySource.STRAVA, ActivitySource.GARMIN] },
+      sport: { in: [ActivitySport.RUN, ActivitySport.TRAIL_RUN, ActivitySport.TREADMILL] },
     },
     orderBy: { startedAt: "desc" },
     take: 180,
