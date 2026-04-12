@@ -640,6 +640,21 @@ p {
   color: var(--muted);
 }
 
+.stride-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.stride-tags span {
+  border: 1px solid rgba(90, 225, 188, 0.35);
+  background: rgba(57, 215, 184, 0.08);
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 0.74rem;
+  color: #9ef3df;
+}
+
 .notes {
   border: 1px solid rgba(154, 193, 255, 0.18);
   border-radius: 14px;

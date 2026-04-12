@@ -9,6 +9,7 @@ export type RunningActivity = {
   id: string;
   source: ActivitySource;
   seriesSource?: "streams" | "splits" | "summary";
+  chartAxis?: "distance" | "split";
   title: string;
   date: string;
   workoutType: string;
@@ -28,6 +29,10 @@ export type RunningActivity = {
   splitsKm: number[];
   splitHr?: number[];
   splitElevation?: number[];
+  streamDistanceKm?: number[];
+  streamPaceSecPerKm?: number[];
+  streamHr?: number[];
+  streamElevationM?: number[];
   paceSeriesSecPerKm: number[];
   hrSeries: number[];
   elevationSeries: number[];

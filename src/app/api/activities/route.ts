@@ -7,6 +7,7 @@ import { ensureDemoUser } from "@/lib/demo-user";
 import { prisma } from "@/lib/prisma";
 
 const SAMPLE_POINTS = 14;
+const DETAIL_STREAM_POINTS = 220;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -21,6 +22,12 @@ const toNumber = (value: unknown) => {
 const toNumberArray = (value: unknown): number[] => {
   if (!Array.isArray(value)) return [];
   return value.map((item) => Number(item)).filter((item) => Number.isFinite(item));
+};
+
+const getStreamData = (streams: JsonRecord | null, key: string): number[] => {
+  const item = streams?.[key];
+  if (!isRecord(item)) return [];
+  return toNumberArray(item.data);
 };
 
 const trimText = (value: string | null | undefined, max = 220) => {
@@ -227,6 +234,7 @@ const mapActivity = (activity: {
   const hrStream = streams && isRecord(streams.heartrate) ? toNumberArray(streams.heartrate.data) : [];
   const paceStreamRaw = streams && isRecord(streams.velocity_smooth) ? toNumberArray(streams.velocity_smooth.data) : [];
   const elevationStream = streams && isRecord(streams.altitude) ? toNumberArray(streams.altitude.data) : [];
+  const distanceStreamRaw = getStreamData(streams, "distance");
   const paceStream = paceStreamRaw
     .map((speed) => (speed > 0 ? 1000 / speed : 0))
     .filter((item) => Number.isFinite(item) && item > 0);
@@ -253,6 +261,27 @@ const mapActivity = (activity: {
         ? smoothSeries(sampleArray(splitElevationProfile, SAMPLE_POINTS, splitElevationProfile[0]), 3)
         : repeatSeries(0, SAMPLE_POINTS);
 
+  const streamDistanceKm =
+    distanceStreamRaw.length > 0
+      ? sampleArray(
+          distanceStreamRaw.map((meters) => meters / 1000),
+          DETAIL_STREAM_POINTS,
+          0,
+        )
+      : [];
+  const streamPaceSecPerKm =
+    paceStream.length > 0
+      ? sampleArray(paceStream, DETAIL_STREAM_POINTS, Math.round(avgPaceSec ?? 300))
+      : [];
+  const streamHr =
+    hrStream.length > 0
+      ? sampleArray(hrStream, DETAIL_STREAM_POINTS, Math.round(avgHr || 140))
+      : [];
+  const streamElevationM =
+    elevationStream.length > 0
+      ? sampleArray(elevationStream, DETAIL_STREAM_POINTS, Math.round(elevationStream[0] ?? 0))
+      : [];
+
   const workoutType = mapWorkoutType(activity.sport);
   const zoneDistribution = buildZoneDistribution(hrSeries, avgHr || 0);
   const description = typeof detail?.description === "string" ? detail.description : null;
@@ -265,11 +294,13 @@ const mapActivity = (activity: {
   const hasStreams = paceStream.length > 0 || hrStream.length > 0 || elevationStream.length > 0;
   const hasSplits = splitPaceValues.length > 0 || splitHrValues.length > 0 || splitElevationProfile.length > 0;
   const seriesSource: "streams" | "splits" | "summary" = hasStreams ? "streams" : hasSplits ? "splits" : "summary";
+  const chartAxis: "distance" | "split" = streamDistanceKm.length > 20 ? "distance" : "split";
 
   return {
     id: activity.id,
     source: activity.source === ActivitySource.STRAVA ? "strava" : "garmin",
     seriesSource,
+    chartAxis,
     title: activity.name,
     date: activity.startedAt.toISOString(),
     workoutType,
@@ -292,6 +323,10 @@ const mapActivity = (activity: {
         : sampleArray(paceSeries, estimatedSplitCount, paceSeries[0]),
     splitHr: derivedSplitHr,
     splitElevation: derivedSplitElevation,
+    streamDistanceKm,
+    streamPaceSecPerKm,
+    streamHr,
+    streamElevationM,
     paceSeriesSecPerKm: paceSeries,
     hrSeries,
     elevationSeries,

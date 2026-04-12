@@ -573,12 +573,27 @@ export function RunningDashboard() {
     (selectedActivity.splitElevation && selectedActivity.splitElevation.length > 0)
       ? selectedActivity.splitElevation
       : selectedActivity.elevationSeries;
+  const streamDistance = selectedActivity.streamDistanceKm ?? [];
+  const streamPace = selectedActivity.streamPaceSecPerKm ?? [];
+  const streamHr = selectedActivity.streamHr ?? [];
+  const streamElevation = selectedActivity.streamElevationM ?? [];
+  const useStreamAxis =
+    selectedActivity.chartAxis === "distance" &&
+    streamDistance.length > 20 &&
+    ((sessionMetric === "pace" && streamPace.length === streamDistance.length) ||
+      (sessionMetric === "hr" && streamHr.length === streamDistance.length) ||
+      (sessionMetric === "elevation" && streamElevation.length === streamDistance.length));
 
   const sessionSeries = useMemo(() => {
+    if (useStreamAxis) {
+      if (sessionMetric === "pace") return streamPace;
+      if (sessionMetric === "hr") return streamHr;
+      return streamElevation;
+    }
     if (sessionMetric === "pace") return paceSplits;
     if (sessionMetric === "hr") return hrSplits;
     return elevationSplits;
-  }, [elevationSplits, hrSplits, paceSplits, sessionMetric]);
+  }, [elevationSplits, hrSplits, paceSplits, sessionMetric, streamElevation, streamHr, streamPace, useStreamAxis]);
 
   const sessionMetricMeta = useMemo(() => {
     if (sessionMetric === "pace") {
@@ -630,7 +645,10 @@ export function RunningDashboard() {
       const norm = (value - min) / range;
       const scaled = sessionMetricMeta.invertScale ? 1 - norm : norm;
       const y = padTop + (1 - scaled) * plotHeight;
-      return { x, y, value, km: index + 1 };
+      const distanceKm = useStreamAxis
+        ? Number(streamDistance[index] ?? 0)
+        : index + 1;
+      return { x, y, value, km: distanceKm };
     });
 
     const linePath = points
@@ -643,10 +661,58 @@ export function RunningDashboard() {
         : "";
 
     return { width, height, padTop, padBottom, padLeft, padRight, plotWidth, plotHeight, points, linePath, areaPath };
-  }, [sessionMetricMeta.invertScale, sessionSeries]);
+  }, [sessionMetricMeta.invertScale, sessionSeries, streamDistance, useStreamAxis]);
 
   const hoveredPoint =
     hoveredKm !== null ? chartGeometry.points[clamp(hoveredKm, 0, chartGeometry.points.length - 1)] ?? null : null;
+
+  const axisLabels = useMemo(() => {
+    if (chartGeometry.points.length === 0) {
+      return { start: "Km 0", mid: "Km 0", end: "Km 0" };
+    }
+    const start = chartGeometry.points[0].km;
+    const mid = chartGeometry.points[Math.floor(chartGeometry.points.length / 2)]?.km ?? start;
+    const end = chartGeometry.points[chartGeometry.points.length - 1]?.km ?? start;
+    if (useStreamAxis) {
+      return {
+        start: `${start.toFixed(1)} km`,
+        mid: `${mid.toFixed(1)} km`,
+        end: `${end.toFixed(1)} km`,
+      };
+    }
+    return {
+      start: `Km ${Math.max(1, Math.round(start))}`,
+      mid: `Km ${Math.max(1, Math.round(mid))}`,
+      end: `Km ${Math.max(1, Math.round(end))}`,
+    };
+  }, [chartGeometry.points, useStreamAxis]);
+
+  const strideBursts = useMemo(() => {
+    if (!useStreamAxis || streamPace.length < 20 || streamDistance.length !== streamPace.length) return [];
+    const baseline = streamPace.reduce((sum, v) => sum + v, 0) / streamPace.length;
+    const threshold = baseline - 22;
+    const bursts: Array<{ startKm: number; endKm: number; pace: number }> = [];
+    let start = -1;
+    for (let i = 0; i < streamPace.length; i += 1) {
+      const isFast = streamPace[i] <= threshold;
+      if (isFast && start === -1) start = i;
+      if ((!isFast || i === streamPace.length - 1) && start !== -1) {
+        const end = isFast && i === streamPace.length - 1 ? i : i - 1;
+        if (end - start >= 2) {
+          const startKm = streamDistance[start];
+          const endKm = streamDistance[end];
+          const avgPace = Math.round(
+            streamPace.slice(start, end + 1).reduce((s, v) => s + v, 0) / (end - start + 1),
+          );
+          if (endKm - startKm <= 0.35) {
+            bursts.push({ startKm, endKm, pace: avgPace });
+          }
+        }
+        start = -1;
+      }
+    }
+    return bursts.slice(0, 10);
+  }, [streamDistance, streamPace, useStreamAxis]);
 
   const goalProgress = (goal: Goal) => {
     if (goal.type === "weekly-km") {
@@ -1151,22 +1217,37 @@ export function RunningDashboard() {
                   ) : null}
                 </svg>
                 <div className="session-axis">
-                  <span>Km 1</span>
-                  <span>Km {Math.max(1, Math.round(sessionSeries.length / 2))}</span>
-                  <span>Km {sessionSeries.length}</span>
+                  <span>{axisLabels.start}</span>
+                  <span>{axisLabels.mid}</span>
+                  <span>{axisLabels.end}</span>
                 </div>
                 <p className="session-summary">{sessionMetricMeta.summary}</p>
                 {hoveredPoint ? (
                   <div className="session-tooltip">
-                    <strong>Km {hoveredPoint.km}</strong>
+                    <strong>{useStreamAxis ? `${hoveredPoint.km.toFixed(2)} km` : `Km ${Math.round(hoveredPoint.km)}`}</strong>
                     <span>{sessionMetricMeta.formatValue(hoveredPoint.value)}</span>
                     <small>Fuente: {selectedActivity.seriesSource ?? "summary"}</small>
                   </div>
                 ) : null}
+                {sessionMetric === "pace" && strideBursts.length > 0 ? (
+                  <div className="stride-tags">
+                    {strideBursts.map((burst, index) => (
+                      <span key={`${selectedActivity.id}-stride-${index}`}>
+                        Stride {index + 1}: {burst.startKm.toFixed(2)}-{burst.endKm.toFixed(2)} km @ {formatPaceFromSeconds(burst.pace)}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
                 <div className="session-splits-row">
-                  {sessionSeries.slice(0, 16).map((value, index) => (
+                  {(useStreamAxis
+                    ? chartGeometry.points
+                        .filter((_, index) => index % Math.max(1, Math.floor(chartGeometry.points.length / 16)) === 0)
+                        .slice(0, 16)
+                        .map((point) => ({ label: `${point.km.toFixed(1)} km`, value: point.value }))
+                    : sessionSeries.slice(0, 16).map((value, index) => ({ label: `K${index + 1}`, value }))
+                  ).map((item, index) => (
                     <span key={`${selectedActivity.id}-metric-${sessionMetric}-${index + 1}`}>
-                      K{index + 1}: {sessionMetricMeta.formatValue(value)}
+                      {item.label}: {sessionMetricMeta.formatValue(item.value)}
                     </span>
                   ))}
                 </div>
