@@ -78,6 +78,18 @@ type SyncApiResult = {
   quota?: StravaQuotaSnapshot | null;
 };
 
+type StreamEnrichResult = {
+  status?: "success" | "throttled";
+  scannedCount?: number;
+  updatedCount?: number;
+  remainingMissing?: number;
+  requestsUsed?: number;
+  retryAtUtc?: string | null;
+  message?: string | null;
+  error?: string;
+  quota?: StravaQuotaSnapshot | null;
+};
+
 type StatCard = {
   label: string;
   value: string;
@@ -89,6 +101,12 @@ type TrainingTarget = {
   value: string;
 };
 
+type HeaderConditionCard = {
+  label: string;
+  value: string;
+  helper: string;
+};
+
 type ActivitiesApiResponse = {
   activities?: RunningActivity[];
   stats?: StatCard[];
@@ -96,7 +114,7 @@ type ActivitiesApiResponse = {
   trainingTargets?: TrainingTarget[];
 };
 
-type SessionMetricKey = "pace" | "hr" | "elevation";
+type SessionMetricKey = "pace" | "hr" | "elevation" | "cadence" | "power";
 
 const sourceLabel = {
   strava: "Strava",
@@ -161,6 +179,11 @@ const formatPaceFromSeconds = (seconds: number) => {
   return `${min}:${String(sec).padStart(2, "0")}`;
 };
 
+const normalizeCadenceValue = (value: number) => {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.round(value < 130 ? value * 2 : value);
+};
+
 const getWeekKey = (isoDate: string) => {
   const date = new Date(isoDate);
   const utc = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
@@ -198,6 +221,60 @@ const formatRaceTime = (totalSeconds: number) => {
 };
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const median = (values: number[]) => {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) return (sorted[mid - 1] + sorted[mid]) / 2;
+  return sorted[mid];
+};
+
+const quantile = (values: number[], q: number) => {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const pos = (sorted.length - 1) * clamp(q, 0, 1);
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const left = sorted[base] ?? sorted[0];
+  const right = sorted[Math.min(sorted.length - 1, base + 1)] ?? left;
+  return left + (right - left) * rest;
+};
+
+const sanitizePaceSeriesForChart = (values: number[]) => {
+  if (values.length < 5) return values;
+  return values.map((value, index) => {
+    const from = Math.max(0, index - 2);
+    const to = Math.min(values.length - 1, index + 2);
+    const neighborhood = values
+      .slice(from, to + 1)
+      .filter((item) => Number.isFinite(item) && item > 120 && item < 900);
+    const localMedian = neighborhood.length > 0 ? median(neighborhood) : value;
+
+    if (!Number.isFinite(value) || value < 120 || value > 900) return localMedian;
+    // Keep faster-than-usual spikes (possible strides), filter only unusually slow spikes
+    // that are usually pauses/GPS glitches.
+    if (value > localMedian + 42) return localMedian;
+    return value;
+  });
+};
+
+const resampleLinear = (values: number[], targetLength: number, fallback = 0): number[] => {
+  if (targetLength <= 0) return [];
+  if (values.length === 0) return Array.from({ length: targetLength }, () => fallback);
+  if (values.length === targetLength) return [...values];
+  if (values.length === 1) return Array.from({ length: targetLength }, () => values[0] ?? fallback);
+
+  return Array.from({ length: targetLength }, (_, index) => {
+    const position = (index / Math.max(1, targetLength - 1)) * (values.length - 1);
+    const lower = Math.floor(position);
+    const upper = Math.min(values.length - 1, Math.ceil(position));
+    const ratio = position - lower;
+    const lowValue = values[lower] ?? fallback;
+    const highValue = values[upper] ?? lowValue;
+    return lowValue + (highValue - lowValue) * ratio;
+  });
+};
 
 const riegelTime = (baseDistanceKm: number, baseSeconds: number, targetDistanceKm: number, exponent = 1.06) => {
   if (baseDistanceKm <= 0 || baseSeconds <= 0 || targetDistanceKm <= 0) return 0;
@@ -237,12 +314,14 @@ export function RunningDashboard() {
   const [stravaExpiresAt, setStravaExpiresAt] = useState<string | null>(null);
   const [stravaSyncing, setStravaSyncing] = useState(false);
   const [stravaBackfilling, setStravaBackfilling] = useState(false);
+  const [stravaStreamEnriching, setStravaStreamEnriching] = useState(false);
   const [stravaSyncMessage, setStravaSyncMessage] = useState<string>("");
   const [stravaHistoryMessage, setStravaHistoryMessage] = useState<string>("");
   const [stravaQuotaMessage, setStravaQuotaMessage] = useState<string>("");
   const [backfillFromDate, setBackfillFromDate] = useState("");
   const [weekCursor, setWeekCursor] = useState(0);
   const [sessionMetric, setSessionMetric] = useState<SessionMetricKey>("pace");
+  const [viewMode, setViewMode] = useState<"overview" | "deep">("overview");
   const [hoveredKm, setHoveredKm] = useState<number | null>(null);
   const chartRef = useRef<SVGSVGElement | null>(null);
 
@@ -488,52 +567,66 @@ export function RunningDashboard() {
   const paceSec = paceToSeconds(selectedActivity.avgPace);
   const paceFactor = Math.max(0.92, Math.min(1.08, 1 + (selectedActivity.tss - 70) / 600));
 
-  const recentRunActivities = useMemo(
-    () =>
-      activities
-        .filter((activity) => activity.distanceKm >= 3 && activity.movingTimeMin >= 15)
-        .slice(0, 12),
-    [activities],
-  );
-
   const baselinePerformance = useMemo(() => {
-    if (recentRunActivities.length === 0) {
+    const pool = activities.filter((activity) => activity.distanceKm >= 4 && activity.movingTimeMin >= 18).slice(0, 40);
+    if (pool.length === 0) {
       const baseDistance = Math.max(5, selectedActivity.distanceKm);
       const baseSeconds = paceSec * baseDistance;
-      return { baseDistanceKm: baseDistance, baseSeconds, volatility: 0.12 };
+      return { baseDistanceKm: baseDistance, baseSeconds, volatility: 0.12, sampleSize: 0, direct10kBest: null as number | null };
     }
 
-    const weighted = recentRunActivities.map((activity, index) => {
-      const recencyWeight = 1 - index * 0.06;
-      const distanceWeight = clamp(activity.distanceKm / 12, 0.45, 1.35);
-      const weight = clamp(recencyWeight * distanceWeight, 0.2, 1.5);
+    const paceValues = pool.map((activity) => paceToSeconds(activity.avgPace)).filter((value) => Number.isFinite(value) && value > 0);
+    const paceMedian = paceValues.length > 0 ? median(paceValues) : paceSec;
+
+    const scored = pool.map((activity, index) => {
+      const title = `${activity.title} ${activity.workoutType} ${activity.planTarget}`.toLowerCase();
+      const qualityKeyword = /(tempo|interval|series|race|carrera|test|parceros|10k|5k|21k|42k|threshold|umbral)/.test(title);
+      const easyKeyword = /(easy|recovery|recuper|rodaje suave|z2)/.test(title);
+      const pace = Math.max(1, paceToSeconds(activity.avgPace));
+      const intensityWeight = clamp(paceMedian / pace, 0.82, 1.42);
+      const loadWeight = clamp(activity.tss / 62, 0.72, 1.38);
+      const recencyWeight = clamp(1 - index * 0.035, 0.55, 1);
+      const qualityBoost = qualityKeyword ? 1.22 : 1;
+      const easyPenalty = easyKeyword ? 0.72 : 1;
+      const weight = recencyWeight * intensityWeight * loadWeight * qualityBoost * easyPenalty;
+      const eq10k = riegelTime(activity.distanceKm, activity.movingTimeMin * 60, 10, 1.06);
       return {
         weight,
-        distanceKm: activity.distanceKm,
-        seconds: activity.movingTimeMin * 60,
+        eq10k,
+        quality: qualityKeyword && !easyKeyword,
       };
     });
 
-    const totalWeight = weighted.reduce((sum, item) => sum + item.weight, 0) || 1;
-    const eq10kSeconds = weighted.reduce((sum, item) => {
-      const eq = riegelTime(item.distanceKm, item.seconds, 10, 1.06);
-      return sum + eq * item.weight;
-    }, 0) / totalWeight;
+    const direct10kCandidates = pool
+      .filter((activity) => activity.distanceKm >= 9.5 && activity.distanceKm <= 10.8 && activity.movingTimeMin >= 35)
+      .map((activity) => Math.round((activity.movingTimeMin * 60 * 10) / Math.max(0.1, activity.distanceKm)));
+    const direct10kBest = direct10kCandidates.length > 0 ? Math.min(...direct10kCandidates) : null;
 
-    const avgEq = eq10kSeconds;
+    const selected = scored.filter((item) => item.quality).slice(0, 12);
+    const effective = (selected.length >= 4 ? selected : scored.slice(0, 12)).filter((item) => Number.isFinite(item.eq10k) && item.eq10k > 0);
+    const totalWeight = effective.reduce((sum, item) => sum + item.weight, 0) || 1;
+    const eq10kTraining = effective.reduce((sum, item) => sum + item.eq10k * item.weight, 0) / totalWeight;
+    const eq10k =
+      direct10kBest !== null
+        ? Math.round(
+            direct10kBest < eq10kTraining * 0.97
+              ? direct10kBest * 0.82 + eq10kTraining * 0.18
+              : direct10kBest * 0.7 + eq10kTraining * 0.3,
+          )
+        : Math.round(eq10kTraining);
+
     const variance =
-      weighted.reduce((sum, item) => {
-        const eq = riegelTime(item.distanceKm, item.seconds, 10, 1.06);
-        return sum + item.weight * Math.pow(eq - avgEq, 2);
-      }, 0) / totalWeight;
-    const volatility = Math.sqrt(Math.max(0, variance)) / Math.max(1, avgEq);
+      effective.reduce((sum, item) => sum + item.weight * Math.pow(item.eq10k - eq10kTraining, 2), 0) / totalWeight;
+    const volatility = Math.sqrt(Math.max(0, variance)) / Math.max(1, eq10kTraining);
 
     return {
       baseDistanceKm: 10,
-      baseSeconds: avgEq,
+      baseSeconds: eq10k,
       volatility,
+      sampleSize: effective.length,
+      direct10kBest,
     };
-  }, [paceSec, recentRunActivities, selectedActivity.distanceKm]);
+  }, [activities, paceSec, selectedActivity.distanceKm]);
 
   const predictions: RacePredict[] = useMemo(() => {
     const distances = [
@@ -561,14 +654,81 @@ export function RunningDashboard() {
     Math.round(
       92 -
         baselinePerformance.volatility * 140 -
-        Math.max(0, 8 - recentRunActivities.length) * 2.8,
+        Math.max(0, 8 - baselinePerformance.sampleSize) * 2.8,
     ),
     58,
     92,
   );
 
+  const last14Activities = activities.slice(0, 14);
+  const acuteLoad = last14Activities.slice(0, 7).reduce((sum, item) => sum + item.tss, 0);
+  const chronicLoad = Math.round(
+    (last14Activities.reduce((sum, item) => sum + item.tss, 0) / Math.max(1, last14Activities.length)) * 7,
+  );
+  const loadRatio = chronicLoad > 0 ? acuteLoad / chronicLoad : 1;
+  const freshness = clamp(Math.round(100 - Math.abs(loadRatio - 1) * 120), 42, 96);
+  const recentBestPaceSec = activities
+    .slice(0, 10)
+    .reduce((best, item) => Math.min(best, paceToSeconds(item.avgPace)), Number.POSITIVE_INFINITY);
+
+  const conditionCards = useMemo<HeaderConditionCard[]>(() => {
+    const useful = activities.filter((activity) => activity.distanceKm >= 6 && activity.movingTimeMin >= 28);
+    const paceCandidates = useful
+      .map((activity) => paceToSeconds(activity.avgPace))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((a, b) => a - b);
+    const thresholdPaceSec =
+      paceCandidates.length > 0
+        ? Math.round(paceCandidates[Math.min(paceCandidates.length - 1, Math.floor(paceCandidates.length * 0.25))] + 10)
+        : paceToSeconds(targets.find((target) => target.label.toLowerCase().includes("umbral"))?.value ?? "4:40 /km");
+
+    const thresholdHrBase = useful
+      .map((activity) => activity.avgHr)
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((a, b) => a - b);
+    const thresholdHr =
+      thresholdHrBase.length > 0
+        ? Math.round(thresholdHrBase[Math.floor(thresholdHrBase.length * 0.7)])
+        : 166;
+
+    const weekKm = latestWeek?.distanceKm ?? 0;
+    const baselineKm = trend.length > 0 ? Math.round((trend.reduce((sum, point) => sum + point.distanceKm, 0) / trend.length) * 10) / 10 : weekKm;
+    const loadState = loadRatio > 1.15 ? "Alta fatiga" : loadRatio < 0.85 ? "Carga baja" : "Equilibrado";
+
+    return [
+      {
+        label: "Ritmo umbral",
+        value: `${formatPaceFromSeconds(thresholdPaceSec - 6)} - ${formatPaceFromSeconds(thresholdPaceSec + 6)} /km`,
+        helper: `Estimado con ${useful.length} sesiones útiles`,
+      },
+      {
+        label: "FC umbral",
+        value: `${Math.max(120, thresholdHr - 4)} - ${thresholdHr + 4} ppm`,
+        helper: `Basado en FC de sesiones recientes`,
+      },
+      {
+        label: "Volumen semana",
+        value: `${weekKm.toFixed(1)} km`,
+        helper: `Base 6 semanas: ${baselineKm.toFixed(1)} km`,
+      },
+      {
+        label: "Condicion actual",
+        value: `${freshness}%`,
+        helper: `${loadState} · AC ratio ${loadRatio.toFixed(2)}`,
+      },
+    ];
+  }, [activities, freshness, latestWeek?.distanceKm, loadRatio, targets, trend]);
+
   const paceSplits = selectedActivity.splitsKm.length > 0 ? selectedActivity.splitsKm : selectedActivity.paceSeriesSecPerKm;
   const hrSplits = (selectedActivity.splitHr && selectedActivity.splitHr.length > 0) ? selectedActivity.splitHr : selectedActivity.hrSeries;
+  const cadenceSplits =
+    selectedActivity.splitCadence && selectedActivity.splitCadence.length > 0
+      ? selectedActivity.splitCadence
+      : selectedActivity.cadenceSeries ?? [selectedActivity.cadence];
+  const powerSplits =
+    selectedActivity.splitPower && selectedActivity.splitPower.length > 0
+      ? selectedActivity.splitPower
+      : selectedActivity.powerSeries ?? [selectedActivity.avgPower];
   const elevationSplits =
     (selectedActivity.splitElevation && selectedActivity.splitElevation.length > 0)
       ? selectedActivity.splitElevation
@@ -576,24 +736,84 @@ export function RunningDashboard() {
   const streamDistance = selectedActivity.streamDistanceKm ?? [];
   const streamPace = selectedActivity.streamPaceSecPerKm ?? [];
   const streamHr = selectedActivity.streamHr ?? [];
+  const streamCadence = selectedActivity.streamCadence ?? [];
+  const streamPower = selectedActivity.streamPower ?? [];
   const streamElevation = selectedActivity.streamElevationM ?? [];
-  const useStreamAxis =
+  const hasDistancePaceStreams =
     selectedActivity.chartAxis === "distance" &&
     streamDistance.length > 20 &&
-    ((sessionMetric === "pace" && streamPace.length === streamDistance.length) ||
-      (sessionMetric === "hr" && streamHr.length === streamDistance.length) ||
-      (sessionMetric === "elevation" && streamElevation.length === streamDistance.length));
+    streamPace.length === streamDistance.length;
 
-  const sessionSeries = useMemo(() => {
-    if (useStreamAxis) {
-      if (sessionMetric === "pace") return streamPace;
-      if (sessionMetric === "hr") return streamHr;
-      return streamElevation;
+  const sessionBundle = useMemo(() => {
+    if (hasDistancePaceStreams) {
+      const targetLength = streamDistance.length;
+      return {
+        source: "streams" as const,
+        distance: streamDistance,
+        pace: streamPace,
+        hr:
+          streamHr.length === targetLength
+            ? streamHr
+            : resampleLinear(hrSplits, targetLength, selectedActivity.avgHr),
+        cadence:
+          streamCadence.length === targetLength
+            ? streamCadence
+            : resampleLinear(cadenceSplits, targetLength, selectedActivity.cadence),
+        power:
+          streamPower.length === targetLength
+            ? streamPower
+            : resampleLinear(powerSplits, targetLength, selectedActivity.avgPower),
+        elevation:
+          streamElevation.length === targetLength
+            ? streamElevation
+            : resampleLinear(elevationSplits, targetLength, 0),
+      };
     }
-    if (sessionMetric === "pace") return paceSplits;
-    if (sessionMetric === "hr") return hrSplits;
-    return elevationSplits;
-  }, [elevationSplits, hrSplits, paceSplits, sessionMetric, streamElevation, streamHr, streamPace, useStreamAxis]);
+
+    const baseLength = Math.max(paceSplits.length, hrSplits.length, elevationSplits.length, 1);
+    return {
+      source: "splits" as const,
+      distance: Array.from({ length: baseLength }, (_, index) => index + 1),
+      pace: resampleLinear(paceSplits, baseLength, paceToSeconds(selectedActivity.avgPace)),
+      hr: resampleLinear(hrSplits, baseLength, selectedActivity.avgHr),
+      cadence: resampleLinear(cadenceSplits, baseLength, selectedActivity.cadence),
+      power: resampleLinear(powerSplits, baseLength, selectedActivity.avgPower),
+      elevation: resampleLinear(elevationSplits, baseLength, 0),
+    };
+  }, [
+    cadenceSplits,
+    elevationSplits,
+    hasDistancePaceStreams,
+    hrSplits,
+    paceSplits,
+    selectedActivity.avgHr,
+    selectedActivity.avgPower,
+    selectedActivity.avgPace,
+    selectedActivity.cadence,
+    powerSplits,
+    streamCadence,
+    streamDistance,
+    streamElevation,
+    streamHr,
+    streamPower,
+    streamPace,
+  ]);
+
+  const useStreamAxis = sessionBundle.source === "streams";
+  const sessionSeries =
+    sessionMetric === "pace"
+      ? sessionBundle.pace
+      : sessionMetric === "hr"
+        ? sessionBundle.hr
+        : sessionMetric === "cadence"
+          ? sessionBundle.cadence
+          : sessionMetric === "power"
+            ? sessionBundle.power
+            : sessionBundle.elevation;
+  const visualSessionSeries = useMemo(() => {
+    if (sessionMetric === "pace") return sanitizePaceSeriesForChart(sessionSeries);
+    return sessionSeries;
+  }, [sessionMetric, sessionSeries]);
 
   const sessionMetricMeta = useMemo(() => {
     if (sessionMetric === "pace") {
@@ -608,7 +828,7 @@ export function RunningDashboard() {
     }
     if (sessionMetric === "hr") {
       return {
-        title: "Frecuencia cardiaca por km",
+        title: "Frecuencia cardiaca",
         colorClass: "session-line-hr",
         yLabel: "ppm",
         invertScale: false,
@@ -616,15 +836,43 @@ export function RunningDashboard() {
         formatValue: (value: number) => `${Math.round(value)} ppm`,
       };
     }
+    if (sessionMetric === "cadence") {
+      return {
+        title: "Cadencia",
+        colorClass: "session-line-cadence",
+        yLabel: "spm",
+        invertScale: false,
+        summary: `Promedio ${selectedActivity.cadence} spm`,
+        formatValue: (value: number) => `${Math.round(value)} spm`,
+      };
+    }
+    if (sessionMetric === "power") {
+      return {
+        title: "Potencia",
+        colorClass: "session-line-power",
+        yLabel: "W",
+        invertScale: false,
+        summary: `Promedio ${selectedActivity.avgPower} W`,
+        formatValue: (value: number) => `${Math.round(value)} W`,
+      };
+    }
     return {
-      title: "Elevacion acumulada por km",
+      title: "Elevacion",
       colorClass: "session-line-elevation",
       yLabel: "m",
       invertScale: false,
       summary: `Desnivel positivo ${selectedActivity.elevationGainM} m`,
       formatValue: (value: number) => `${Math.round(value)} m`,
     };
-  }, [selectedActivity.avgHr, selectedActivity.avgPace, selectedActivity.elevationGainM, selectedActivity.maxHr, sessionMetric]);
+  }, [
+    selectedActivity.avgHr,
+    selectedActivity.avgPace,
+    selectedActivity.avgPower,
+    selectedActivity.cadence,
+    selectedActivity.elevationGainM,
+    selectedActivity.maxHr,
+    sessionMetric,
+  ]);
 
   const chartGeometry = useMemo(() => {
     const width = 700;
@@ -636,19 +884,27 @@ export function RunningDashboard() {
     const plotWidth = width - padLeft - padRight;
     const plotHeight = height - padTop - padBottom;
     const values = sessionSeries;
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const range = max - min || 1;
+    const visualValues = visualSessionSeries;
+    const safeMin = Math.min(...visualValues);
+    const safeMax = Math.max(...visualValues);
+    const lowQ = quantile(visualValues, sessionMetric === "pace" ? 0.01 : 0.05);
+    const highQ = quantile(visualValues, sessionMetric === "pace" ? 0.97 : 0.95);
+    const robustMin = sessionMetric === "pace" ? Math.min(lowQ, safeMin) : Math.min(lowQ, safeMin);
+    const robustMax = sessionMetric === "pace" ? highQ : Math.max(highQ, safeMax);
+    const pad = Math.max(1, (robustMax - robustMin) * 0.08);
+    const yMin = robustMin - pad;
+    const yMax = robustMax + pad;
+    const range = yMax - yMin || 1;
 
     const points = values.map((value, index) => {
       const x = padLeft + (index / Math.max(1, values.length - 1)) * plotWidth;
-      const norm = (value - min) / range;
+      const visualValue = visualValues[index] ?? value;
+      const clamped = clamp(visualValue, yMin, yMax);
+      const norm = (clamped - yMin) / range;
       const scaled = sessionMetricMeta.invertScale ? 1 - norm : norm;
       const y = padTop + (1 - scaled) * plotHeight;
-      const distanceKm = useStreamAxis
-        ? Number(streamDistance[index] ?? 0)
-        : index + 1;
-      return { x, y, value, km: distanceKm };
+      const distanceKm = Number(sessionBundle.distance[index] ?? (index + 1));
+      return { x, y, value, visualValue, km: distanceKm };
     });
 
     const linePath = points
@@ -660,11 +916,46 @@ export function RunningDashboard() {
         ? `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${(padTop + plotHeight).toFixed(2)} L ${points[0].x.toFixed(2)} ${(padTop + plotHeight).toFixed(2)} Z`
         : "";
 
-    return { width, height, padTop, padBottom, padLeft, padRight, plotWidth, plotHeight, points, linePath, areaPath };
-  }, [sessionMetricMeta.invertScale, sessionSeries, streamDistance, useStreamAxis]);
+    return {
+      width,
+      height,
+      padTop,
+      padBottom,
+      padLeft,
+      padRight,
+      plotWidth,
+      plotHeight,
+      points,
+      linePath,
+      areaPath,
+      yMin,
+      yMax,
+    };
+  }, [sessionBundle.distance, sessionMetric, sessionMetricMeta.invertScale, sessionSeries, visualSessionSeries]);
 
   const hoveredPoint =
     hoveredKm !== null ? chartGeometry.points[clamp(hoveredKm, 0, chartGeometry.points.length - 1)] ?? null : null;
+
+  const hoveredMetrics = useMemo(() => {
+    if (hoveredKm === null || sessionBundle.distance.length === 0) return null;
+    const safeIndex = clamp(hoveredKm, 0, sessionBundle.distance.length - 1);
+    return {
+      distance: sessionBundle.distance[safeIndex] ?? 0,
+      pace: sessionBundle.pace[safeIndex] ?? 0,
+      hr: sessionBundle.hr[safeIndex] ?? 0,
+      cadence: normalizeCadenceValue(sessionBundle.cadence[safeIndex] ?? 0),
+      power: sessionBundle.power[safeIndex] ?? 0,
+      elevation: sessionBundle.elevation[safeIndex] ?? 0,
+    };
+  }, [
+    hoveredKm,
+    sessionBundle.cadence,
+    sessionBundle.distance,
+    sessionBundle.elevation,
+    sessionBundle.hr,
+    sessionBundle.pace,
+    sessionBundle.power,
+  ]);
 
   const axisLabels = useMemo(() => {
     if (chartGeometry.points.length === 0) {
@@ -687,24 +978,31 @@ export function RunningDashboard() {
     };
   }, [chartGeometry.points, useStreamAxis]);
 
+  const yAxisLabels = useMemo(() => {
+    const minLabel = sessionMetricMeta.formatValue(chartGeometry.yMin);
+    const maxLabel = sessionMetricMeta.formatValue(chartGeometry.yMax);
+    return { minLabel, maxLabel };
+  }, [chartGeometry.yMax, chartGeometry.yMin, sessionMetricMeta]);
+
   const strideBursts = useMemo(() => {
-    if (!useStreamAxis || streamPace.length < 20 || streamDistance.length !== streamPace.length) return [];
-    const baseline = streamPace.reduce((sum, v) => sum + v, 0) / streamPace.length;
-    const threshold = baseline - 22;
+    if (!useStreamAxis || sessionBundle.pace.length < 20 || sessionBundle.distance.length !== sessionBundle.pace.length) return [];
+    const baseline = median(sessionBundle.pace);
+    const threshold = Math.max(160, baseline - Math.max(12, baseline * 0.06));
     const bursts: Array<{ startKm: number; endKm: number; pace: number }> = [];
     let start = -1;
-    for (let i = 0; i < streamPace.length; i += 1) {
-      const isFast = streamPace[i] <= threshold;
+    for (let i = 0; i < sessionBundle.pace.length; i += 1) {
+      const isFast = sessionBundle.pace[i] <= threshold;
       if (isFast && start === -1) start = i;
-      if ((!isFast || i === streamPace.length - 1) && start !== -1) {
-        const end = isFast && i === streamPace.length - 1 ? i : i - 1;
-        if (end - start >= 2) {
-          const startKm = streamDistance[start];
-          const endKm = streamDistance[end];
+      if ((!isFast || i === sessionBundle.pace.length - 1) && start !== -1) {
+        const end = isFast && i === sessionBundle.pace.length - 1 ? i : i - 1;
+        if (end - start >= 1) {
+          const startKm = sessionBundle.distance[start];
+          const endKm = sessionBundle.distance[end];
           const avgPace = Math.round(
-            streamPace.slice(start, end + 1).reduce((s, v) => s + v, 0) / (end - start + 1),
+            sessionBundle.pace.slice(start, end + 1).reduce((s, v) => s + v, 0) / (end - start + 1),
           );
-          if (endKm - startKm <= 0.35) {
+          const segmentDistance = endKm - startKm;
+          if (segmentDistance >= 0.03 && segmentDistance <= 0.45) {
             bursts.push({ startKm, endKm, pace: avgPace });
           }
         }
@@ -712,7 +1010,48 @@ export function RunningDashboard() {
       }
     }
     return bursts.slice(0, 10);
-  }, [streamDistance, streamPace, useStreamAxis]);
+  }, [sessionBundle.distance, sessionBundle.pace, useStreamAxis]);
+
+  const paceRange = useMemo(() => {
+    if (sessionBundle.pace.length === 0) return "N/D";
+    const sanitized = sanitizePaceSeriesForChart(sessionBundle.pace).filter(
+      (value) => Number.isFinite(value) && value >= 140 && value <= 720,
+    );
+    if (sanitized.length === 0) return "N/D";
+    const min = quantile(sanitized, 0.1);
+    const max = quantile(sanitized, 0.9);
+    return `${formatPaceFromSeconds(Math.round(min))} - ${formatPaceFromSeconds(Math.round(max))} /km`;
+  }, [sessionBundle.pace]);
+
+  const hrDrift = useMemo(() => {
+    const values = sessionBundle.hr;
+    if (values.length < 6) return 0;
+    const chunk = Math.max(2, Math.floor(values.length * 0.2));
+    const startAvg = values.slice(0, chunk).reduce((s, v) => s + v, 0) / chunk;
+    const endAvg = values.slice(values.length - chunk).reduce((s, v) => s + v, 0) / chunk;
+    return Math.round(endAvg - startAvg);
+  }, [sessionBundle.hr]);
+
+  const overviewWeekActivities = activityWeeks[0]?.items ?? activities.slice(0, 7);
+  const activeGoalsCount = goals.filter((goal) => goal.status === "active").length;
+  const nextActiveGoal = goals
+    .filter((goal) => goal.status === "active")
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate))[0];
+  const coachStatus =
+    loadRatio > 1.18
+      ? "Carga alta: prioriza recuperacion de calidad."
+      : loadRatio < 0.82
+        ? "Carga baja: semana buena para meter calidad."
+        : "Carga estable: sostiene consistencia y progresion.";
+  const weekMix = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const activity of overviewWeekActivities) {
+      map.set(activity.workoutType, (map.get(activity.workoutType) ?? 0) + 1);
+    }
+    return Array.from(map.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4);
+  }, [overviewWeekActivities]);
 
   const goalProgress = (goal: Goal) => {
     if (goal.type === "weekly-km") {
@@ -886,7 +1225,15 @@ export function RunningDashboard() {
     setStravaSyncing(true);
     setStravaSyncMessage("Sincronizando actividades de Strava...");
     try {
-      const response = await fetch("/api/strava/sync", { method: "POST" });
+      const response = await fetch("/api/strava/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          includeStreams: true,
+          maxPages: 1,
+          maxRequests: 40,
+        }),
+      });
       const payload = (await response.json()) as SyncApiResult;
       if (!response.ok) {
         throw new Error(payload.error || "No se pudo completar la sincronizacion.");
@@ -947,6 +1294,56 @@ export function RunningDashboard() {
     }
   };
 
+  const enrichStravaStreams = async () => {
+    setStravaStreamEnriching(true);
+    setStravaSyncMessage("Enriqueciendo streams en actividades recientes...");
+    try {
+      const response = await fetch("/api/strava/streams", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          maxActivities: 28,
+          maxRequests: 70,
+        }),
+      });
+      const payload = (await response.json()) as StreamEnrichResult;
+      if (!response.ok) {
+        throw new Error(payload.error || "No se pudo enriquecer streams.");
+      }
+
+      if (payload.status === "throttled") {
+        const retryAt = formatRetryAt(payload.retryAtUtc);
+        setStravaSyncMessage(
+          `${payload.message ?? "Enriquecimiento pausado por cuota."}${retryAt ? ` Reanuda desde ${retryAt}.` : ""}`,
+        );
+      } else {
+        setStravaSyncMessage(
+          `Streams OK: ${payload.updatedCount ?? 0} actividades enriquecidas (${payload.requestsUsed ?? 0} requests). Pendientes: ${payload.remainingMissing ?? 0}.`,
+        );
+      }
+      updateQuotaMessage(payload.quota ?? null);
+      await refreshStravaOverview();
+      const activitiesResponse = await fetch("/api/activities");
+      if (activitiesResponse.ok) {
+        const activitiesPayload = (await activitiesResponse.json()) as ActivitiesApiResponse;
+        if (Array.isArray(activitiesPayload.activities) && activitiesPayload.activities.length > 0) {
+          setActivities(activitiesPayload.activities);
+          setSelectedId((current) =>
+            activitiesPayload.activities?.some((item) => item.id === current)
+              ? current
+              : (activitiesPayload.activities?.[0]?.id ?? current),
+          );
+        }
+      }
+    } catch (streamError) {
+      setStravaSyncMessage(
+        streamError instanceof Error ? streamError.message : "Error enriqueciendo streams.",
+      );
+    } finally {
+      setStravaStreamEnriching(false);
+    }
+  };
+
   const analyzeActivity = () => {
     startTransition(async () => {
       setError(null);
@@ -989,10 +1386,10 @@ export function RunningDashboard() {
       <header className="dashboard-header">
         <div>
           <p className="kicker">StrideOS Running</p>
-          <h1>Dashboard de actividades, predicts y objetivos</h1>
+          <h1>Centro de rendimiento running</h1>
           <p className="subtitle">
-            Historial, metricas de rendimiento, graficas de sesion, prediccion de carrera y analisis
-            automatizado con IA.
+            Historial completo, lectura semanal, analisis de sesiones en detalle, predicciones de carrera y
+            recomendaciones con IA para decidir que hacer en el siguiente bloque.
           </p>
           <div className="strava-connect">
             <span className={`status-dot${stravaConnected ? " is-on" : ""}`} />
@@ -1020,6 +1417,16 @@ export function RunningDashboard() {
               </button>
             ) : null}
             {stravaConnected ? (
+              <button
+                className="strava-sync-button"
+                disabled={stravaStreamEnriching}
+                onClick={enrichStravaStreams}
+                type="button"
+              >
+                {stravaStreamEnriching ? "Streams..." : "Completar streams"}
+              </button>
+            ) : null}
+            {stravaConnected ? (
               <input
                 className="strava-date-input"
                 type="date"
@@ -1037,30 +1444,128 @@ export function RunningDashboard() {
             {stravaQuotaMessage ? (
               <p className="strava-sync-message strava-sync-message-soft">{stravaQuotaMessage}</p>
             ) : null}
+            <p className="strava-sync-message strava-sync-message-soft">
+              Para ver graficas finas (strides/variaciones), usa "Completar streams" por lotes.
+            </p>
           </div>
           {activitiesLoading ? <p className="strava-sync-message">Cargando actividades reales...</p> : null}
           {activitiesError ? <p className="error-message">{activitiesError}</p> : null}
         </div>
         <div className="header-badges">
-          {targets.map((target) => (
-            <article key={target.label} className="header-pill">
+          {conditionCards.map((target) => (
+            <article key={target.label} className="header-pill header-pill-extended">
               <span>{target.label}</span>
               <strong>{target.value}</strong>
+              <small>{target.helper}</small>
             </article>
           ))}
         </div>
       </header>
 
-      <section className="kpi-grid">
-        {stats.map((stat) => (
-          <article key={stat.label} className="kpi-card">
-            <span>{stat.label}</span>
-            <strong>{stat.value}</strong>
-            <small>{stat.helper}</small>
-          </article>
-        ))}
+      <section className="view-switch">
+        <button
+          type="button"
+          className={`view-switch-btn${viewMode === "overview" ? " is-active" : ""}`}
+          onClick={() => setViewMode("overview")}
+        >
+          Resumen
+        </button>
+        <button
+          type="button"
+          className={`view-switch-btn${viewMode === "deep" ? " is-active" : ""}`}
+          onClick={() => setViewMode("deep")}
+        >
+          Sesion en detalle
+        </button>
       </section>
 
+      {viewMode === "overview" ? (
+      <>
+      <section className="overview-cockpit">
+        <article className="panel overview-hero">
+          <div className="panel-head">
+            <h2>Estado de la semana</h2>
+            <span>{overviewWeekActivities.length} sesiones</span>
+          </div>
+          <p className="panel-copy">{coachStatus}</p>
+          <div className="hero-metrics">
+            <article>
+              <span>Freshness</span>
+              <strong>{freshness}%</strong>
+            </article>
+            <article>
+              <span>Acute load</span>
+              <strong>{acuteLoad}</strong>
+            </article>
+            <article>
+              <span>AC ratio</span>
+              <strong>{loadRatio.toFixed(2)}</strong>
+            </article>
+            <article>
+              <span>Mejor ritmo reciente</span>
+              <strong>{recentBestPaceSec < Number.POSITIVE_INFINITY ? `${formatPaceFromSeconds(recentBestPaceSec)} /km` : "N/D"}</strong>
+            </article>
+          </div>
+          <div className="mix-tags">
+            {weekMix.map(([type, count]) => (
+              <span key={`mix-${type}`}>{type}: {count}</span>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel overview-focus">
+          <div className="panel-head">
+            <h2>Foco actual</h2>
+            <span>{activeGoalsCount} objetivos activos</span>
+          </div>
+          <div className="focus-card">
+            <p>
+              {nextActiveGoal
+                ? `${nextActiveGoal.title} · vence ${nextActiveGoal.dueDate}`
+                : "Sin objetivo activo. Crea uno para guiar tu bloque."}
+            </p>
+            <button
+              type="button"
+              className="week-nav-button"
+              onClick={() => {
+                setViewMode("deep");
+                if (overviewWeekActivities[0]) setSelectedId(overviewWeekActivities[0].id);
+              }}
+            >
+              Abrir sesion mas reciente
+            </button>
+          </div>
+        </article>
+      </section>
+
+      <section className="panel week-timeline-panel">
+        <div className="panel-head">
+          <h2>Timeline semanal</h2>
+          <span>Click para abrir deep dive</span>
+        </div>
+        <div className="week-timeline">
+          {overviewWeekActivities.slice().reverse().map((activity) => (
+            <button
+              key={`timeline-${activity.id}`}
+              type="button"
+              className={`timeline-item${activity.id === selectedActivity.id ? " is-active" : ""}`}
+              onClick={() => {
+                setSelectedId(activity.id);
+                setViewMode("deep");
+              }}
+            >
+              <strong>{activity.title}</strong>
+              <span>{formatDate(activity.date)}</span>
+              <small>{activity.distanceKm.toFixed(1)} km · {activity.avgPace} · TSS {activity.tss}</small>
+            </button>
+          ))}
+        </div>
+      </section>
+      </>
+      ) : null}
+
+      {viewMode === "deep" ? (
+      <>
       <section className="content-grid">
         <aside className="panel activity-list-panel">
           <div className="panel-head">
@@ -1116,46 +1621,55 @@ export function RunningDashboard() {
         </aside>
 
         <section className="panel detail-panel">
-          <div className="panel-head">
+          <div className="panel-head cockpit-head">
             <div>
               <h2>{selectedActivity.title}</h2>
               <p>{selectedActivity.planTarget}</p>
+              <div className="cockpit-session-meta">
+                <span>{selectedActivity.workoutType}</span>
+                <span>{formatDate(selectedActivity.date)}</span>
+                <span>{sourceLabel[selectedActivity.source]}</span>
+              </div>
             </div>
             <button className="analyze-button" disabled={isPending} onClick={analyzeActivity} type="button">
               {isPending ? "Analizando..." : "Analizar con IA"}
             </button>
           </div>
 
-          <div className="detail-metrics-grid">
-            <article>
-              <span>Distancia</span>
-              <strong>{selectedActivity.distanceKm.toFixed(1)} km</strong>
-            </article>
-            <article>
-              <span>Tiempo mov.</span>
-              <strong>{selectedActivity.movingTimeMin} min</strong>
-            </article>
-            <article>
-              <span>Ritmo medio</span>
-              <strong>{selectedActivity.avgPace}</strong>
-            </article>
-            <article>
-              <span>FC media</span>
-              <strong>{selectedActivity.avgHr} ppm</strong>
-            </article>
-            <article>
-              <span>Cadencia</span>
-              <strong>{selectedActivity.cadence} spm</strong>
-            </article>
-            <article>
-              <span>Potencia</span>
-              <strong>{selectedActivity.avgPower} W</strong>
-            </article>
-          </div>
+          <div className="detail-cockpit-grid">
+            <div className="detail-main">
+              <div className="detail-metrics-grid">
+                <article>
+                  <span>Distancia</span>
+                  <strong>{selectedActivity.distanceKm.toFixed(1)} km</strong>
+                </article>
+                <article>
+                  <span>Tiempo mov.</span>
+                  <strong>{selectedActivity.movingTimeMin} min</strong>
+                </article>
+                <article>
+                  <span>Ritmo medio</span>
+                  <strong>{selectedActivity.avgPace}</strong>
+                </article>
+                <article>
+                  <span>FC media</span>
+                  <strong>{selectedActivity.avgHr} ppm</strong>
+                </article>
+                <article>
+                  <span>Cadencia</span>
+                  <strong>{normalizeCadenceValue(selectedActivity.cadence)} spm</strong>
+                </article>
+                <article>
+                  <span>Potencia</span>
+                  <strong>{selectedActivity.avgPower} W</strong>
+                </article>
+              </div>
 
-          <article className="session-chart-card">
+              <article className="session-chart-card">
             <div className="session-chart-head">
-              <h3>{sessionMetricMeta.title}</h3>
+              <h3>
+                {sessionMetricMeta.title} {useStreamAxis ? "por distancia" : "por tramo"}
+              </h3>
               <div className="session-tabs">
                 <button
                   type="button"
@@ -1177,6 +1691,20 @@ export function RunningDashboard() {
                   onClick={() => setSessionMetric("elevation")}
                 >
                   Elevacion
+                </button>
+                <button
+                  type="button"
+                  className={`session-tab${sessionMetric === "cadence" ? " is-active" : ""}`}
+                  onClick={() => setSessionMetric("cadence")}
+                >
+                  Cadencia
+                </button>
+                <button
+                  type="button"
+                  className={`session-tab${sessionMetric === "power" ? " is-active" : ""}`}
+                  onClick={() => setSessionMetric("power")}
+                >
+                  Potencia
                 </button>
               </div>
             </div>
@@ -1216,17 +1744,30 @@ export function RunningDashboard() {
                     </>
                   ) : null}
                 </svg>
+                <div className="session-yaxis">
+                  <span>Max: {yAxisLabels.maxLabel}</span>
+                  <span>Min: {yAxisLabels.minLabel}</span>
+                </div>
                 <div className="session-axis">
                   <span>{axisLabels.start}</span>
                   <span>{axisLabels.mid}</span>
                   <span>{axisLabels.end}</span>
                 </div>
                 <p className="session-summary">{sessionMetricMeta.summary}</p>
-                {hoveredPoint ? (
+                {sessionMetric === "pace" ? (
+                  <p className="session-hint">
+                    Escala robusta: limpia pausas/ruido lento y conserva picos rapidos de strides.
+                  </p>
+                ) : null}
+                {hoveredPoint && hoveredMetrics ? (
                   <div className="session-tooltip">
-                    <strong>{useStreamAxis ? `${hoveredPoint.km.toFixed(2)} km` : `Km ${Math.round(hoveredPoint.km)}`}</strong>
-                    <span>{sessionMetricMeta.formatValue(hoveredPoint.value)}</span>
-                    <small>Fuente: {selectedActivity.seriesSource ?? "summary"}</small>
+                    <strong>{useStreamAxis ? `${hoveredMetrics.distance.toFixed(2)} km` : `Km ${Math.round(hoveredMetrics.distance)}`}</strong>
+                    <span>Ritmo: {formatPaceFromSeconds(hoveredMetrics.pace)} /km</span>
+                    <span>FC: {Math.round(hoveredMetrics.hr)} ppm</span>
+                    <span>Cad: {normalizeCadenceValue(hoveredMetrics.cadence)} spm</span>
+                    <span>Pot: {Math.round(hoveredMetrics.power)} W</span>
+                    <span>Elev: {Math.round(hoveredMetrics.elevation)} m</span>
+                    <small>Fuente: {sessionBundle.source}</small>
                   </div>
                 ) : null}
                 {sessionMetric === "pace" && strideBursts.length > 0 ? (
@@ -1251,50 +1792,129 @@ export function RunningDashboard() {
                     </span>
                   ))}
                 </div>
+                {!useStreamAxis ? (
+                  <p className="session-hint">
+                    Esta actividad no trae streams de alta resolucion; para ver strides exactos necesitas datos de stream (distance + pace + hr + elevation).
+                  </p>
+                ) : null}
               </>
             ) : (
               <p className="session-summary">No hay datos suficientes por tramos para esta métrica.</p>
             )}
-          </article>
+              </article>
 
-          <div className="notes">
-            <h3>Notas de sesion</h3>
-            <p>{selectedActivity.notes}</p>
-          </div>
-
-          <div className="analysis-card">
-            <div className="analysis-head">
-              <h3>Analisis IA</h3>
-              {analysis ? (
-                <span className="score-pill">Score {analysis.score}/100</span>
-              ) : (
-                <span className="score-pill score-pill--muted">Pendiente</span>
-              )}
+              <article className="panel split-table split-table-inline">
+                <div className="panel-head">
+                  <h2>Splits por kilometro</h2>
+                  <span>{selectedActivity.splitsKm.length} tramos</span>
+                </div>
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Km</th>
+                        <th>Pace</th>
+                        <th>FC</th>
+                        <th>Cad</th>
+                        <th>Pot</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {selectedActivity.splitsKm.map((split, index) => (
+                        <tr key={`${selectedActivity.id}-inline-${index + 1}`}>
+                          <td>{index + 1}</td>
+                          <td>{formatPaceFromSeconds(split)} /km</td>
+                          <td>{Math.round(selectedActivity.splitHr?.[index] ?? selectedActivity.avgHr)} ppm</td>
+                          <td>{normalizeCadenceValue(selectedActivity.splitCadence?.[index] ?? selectedActivity.cadence)} spm</td>
+                          <td>{Math.round(selectedActivity.splitPower?.[index] ?? selectedActivity.avgPower)} W</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
             </div>
-            {error ? <p className="error-message">{error}</p> : null}
-            {analysis ? (
-              <>
-                <p className="analysis-summary">{analysis.summary}</p>
-                <ul>
-                  {analysis.insights.map((insight) => (
-                    <li key={insight}>{insight}</li>
-                  ))}
-                </ul>
-                <p className="analysis-recommendation">{analysis.recommendation}</p>
-                <small>
-                  Motor: {analysis.source === "openai" ? analysis.model ?? "OpenAI" : "Fallback local"}
-                </small>
-              </>
-            ) : (
-              <p>
-                Pulsa <strong>Analizar con IA</strong> para obtener una lectura del entrenamiento y una
-                recomendacion concreta para la siguiente sesion.
-              </p>
-            )}
+
+            <aside className="detail-side">
+              <div className="session-quick-insights">
+                <article>
+                  <span>Fuente de datos</span>
+                  <strong>{useStreamAxis ? "Streams completos" : "Splits / resumen"}</strong>
+                </article>
+                <article>
+                  <span>Rango de ritmo</span>
+                  <strong>{paceRange}</strong>
+                </article>
+                <article>
+                  <span>Deriva FC</span>
+                  <strong>{hrDrift >= 0 ? `+${hrDrift}` : hrDrift} ppm</strong>
+                </article>
+                <article>
+                  <span>Strides detectados</span>
+                  <strong>{strideBursts.length}</strong>
+                </article>
+              </div>
+
+              {sessionMetric === "pace" && strideBursts.length > 0 ? (
+                <article className="panel mini-panel">
+                  <div className="panel-head">
+                    <h3>Bloques rapidos</h3>
+                    <span>{strideBursts.length}</span>
+                  </div>
+                  <div className="stride-tags">
+                    {strideBursts.map((burst, index) => (
+                      <span key={`${selectedActivity.id}-side-stride-${index}`}>
+                        {burst.startKm.toFixed(2)}-{burst.endKm.toFixed(2)} km · {formatPaceFromSeconds(burst.pace)}
+                      </span>
+                    ))}
+                  </div>
+                </article>
+              ) : null}
+
+              <div className="notes">
+                <h3>Notas de sesion</h3>
+                <p>{selectedActivity.notes}</p>
+              </div>
+
+              <div className="analysis-card">
+                <div className="analysis-head">
+                  <h3>Analisis IA</h3>
+                  {analysis ? (
+                    <span className="score-pill">Score {analysis.score}/100</span>
+                  ) : (
+                    <span className="score-pill score-pill--muted">Pendiente</span>
+                  )}
+                </div>
+                {error ? <p className="error-message">{error}</p> : null}
+                {analysis ? (
+                  <>
+                    <p className="analysis-summary">{analysis.summary}</p>
+                    <ul>
+                      {analysis.insights.map((insight) => (
+                        <li key={insight}>{insight}</li>
+                      ))}
+                    </ul>
+                    <p className="analysis-recommendation">{analysis.recommendation}</p>
+                    <small>
+                      Motor: {analysis.source === "openai" ? analysis.model ?? "OpenAI" : "Fallback local"}
+                    </small>
+                  </>
+                ) : (
+                  <p>
+                    Pulsa <strong>Analizar con IA</strong> para obtener una lectura del entrenamiento y una
+                    recomendacion concreta para la siguiente sesion.
+                  </p>
+                )}
+              </div>
+            </aside>
           </div>
         </section>
       </section>
+      </>
+      ) : null}
 
+      {viewMode === "overview" ? (
+      <>
       <section className="race-goals-grid">
         <article className="panel race-panel">
           <div className="panel-head">
@@ -1302,7 +1922,7 @@ export function RunningDashboard() {
             <span>Confianza {confidence}%</span>
           </div>
           <p className="panel-copy">
-            Basado en tus ultimas {recentRunActivities.length} sesiones utiles y escalado con modelo de fatiga.
+            Basado en {baselinePerformance.sampleSize} sesiones de rendimiento (tempo/interval/race) y ajuste por fatiga.
           </p>
           <div className="predict-grid">
             {predictions.map((prediction) => (
@@ -1314,7 +1934,8 @@ export function RunningDashboard() {
             ))}
           </div>
           <p className="panel-copy">
-            Base equivalente 10K: {formatRaceTime(Math.round(baselinePerformance.baseSeconds))}.
+            Base equivalente 10K: {formatRaceTime(Math.round(baselinePerformance.baseSeconds))}
+            {baselinePerformance.direct10kBest ? ` · Mejor 10K detectado: ${formatRaceTime(baselinePerformance.direct10kBest)}` : ""}.
           </p>
         </article>
 
@@ -1544,33 +2165,10 @@ export function RunningDashboard() {
           </div>
         </article>
       </section>
+      </>
+      ) : null}
 
-      <section className="split-table panel">
-        <div className="panel-head">
-          <h2>Splits por kilometro</h2>
-          <span>{selectedActivity.splitsKm.length} tramos</span>
-        </div>
-        <div className="table-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>Km</th>
-                <th>Pace</th>
-                <th>Min/km</th>
-              </tr>
-            </thead>
-            <tbody>
-              {selectedActivity.splitsKm.map((split, index) => (
-                <tr key={`${selectedActivity.id}-${index + 1}`}>
-                  <td>{index + 1}</td>
-                  <td>{split}s</td>
-                  <td>{toMinutes(split)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </section>
+      
     </main>
   );
 }
