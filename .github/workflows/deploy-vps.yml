@@ -1,0 +1,106 @@
+name: Deploy VPS
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch a desplegar"
+        required: false
+        default: "main"
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: true
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DEPLOY_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref_name }}
+      DEPLOY_REPO: https://github.com/${{ github.repository }}.git
+      DEPLOY_DIR: /opt/strideos
+      APP_PORT: "3080"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Install sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          if [ -z "${VPS_PORT}" ]; then VPS_PORT="22"; fi
+          if [ -z "${VPS_USER}" ]; then VPS_USER="root"; fi
+          sshpass -p "$VPS_PASSWORD" ssh -o StrictHostKeyChecking=no -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
+            "DEPLOY_BRANCH='$DEPLOY_BRANCH' DEPLOY_REPO='$DEPLOY_REPO' DEPLOY_DIR='$DEPLOY_DIR' APP_PORT='$APP_PORT' bash -s" <<'EOF'
+          set -euo pipefail
+
+          BRANCH="${DEPLOY_BRANCH:-main}"
+          REPO="${DEPLOY_REPO}"
+          APP_DIR="${DEPLOY_DIR:-/opt/strideos}"
+          APP_PORT="${APP_PORT:-3080}"
+          TMP_DIR="/tmp/strideos-bootstrap"
+
+          command -v git >/dev/null 2>&1 || { echo "git no instalado"; exit 1; }
+          command -v docker >/dev/null 2>&1 || { echo "docker no instalado"; exit 1; }
+          docker compose version >/dev/null 2>&1 || { echo "docker compose plugin no disponible"; exit 1; }
+
+          mkdir -p "$APP_DIR"
+
+          if [ ! -d "$APP_DIR/.git" ]; then
+            rm -rf "$TMP_DIR"
+            git clone --branch "$BRANCH" "$REPO" "$TMP_DIR"
+
+            if [ -f "$APP_DIR/.env" ]; then
+              cp "$APP_DIR/.env" "$TMP_DIR/.env"
+            fi
+            if [ -f "$APP_DIR/.env.local" ]; then
+              cp "$APP_DIR/.env.local" "$TMP_DIR/.env.local"
+            fi
+
+            find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.env' ! -name '.env.local' -exec rm -rf {} +
+            cp -a "$TMP_DIR"/. "$APP_DIR"/
+            rm -rf "$TMP_DIR"
+          fi
+
+          cd "$APP_DIR"
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+          git reset --hard "origin/$BRANCH"
+
+          if [ ! -f ".env" ]; then
+            echo "Falta $APP_DIR/.env"
+            exit 1
+          fi
+
+          docker compose --profile ops run --rm migrate
+          docker compose up -d --build app
+
+          sleep 5
+          curl -fsS "http://127.0.0.1:${APP_PORT}/api/health" >/dev/null
+          docker compose ps
+          EOF
