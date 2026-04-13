@@ -25,6 +25,7 @@ jobs:
       DEPLOY_REPO: https://github.com/${{ github.repository }}.git
       DEPLOY_DIR: /opt/strideos
       APP_PORT: "3080"
+      RUN_MIGRATIONS: "false"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,13 +57,14 @@ jobs:
           if [ -z "${VPS_PORT}" ]; then VPS_PORT="22"; fi
           if [ -z "${VPS_USER}" ]; then VPS_USER="root"; fi
           sshpass -p "$VPS_PASSWORD" ssh -o StrictHostKeyChecking=no -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
-            "DEPLOY_BRANCH='$DEPLOY_BRANCH' DEPLOY_REPO='$DEPLOY_REPO' DEPLOY_DIR='$DEPLOY_DIR' APP_PORT='$APP_PORT' bash -s" <<'EOF'
+            "DEPLOY_BRANCH='$DEPLOY_BRANCH' DEPLOY_REPO='$DEPLOY_REPO' DEPLOY_DIR='$DEPLOY_DIR' APP_PORT='$APP_PORT' RUN_MIGRATIONS='$RUN_MIGRATIONS' bash -s" <<'EOF'
           set -euo pipefail
 
           BRANCH="${DEPLOY_BRANCH:-main}"
           REPO="${DEPLOY_REPO}"
           APP_DIR="${DEPLOY_DIR:-/opt/strideos}"
           APP_PORT="${APP_PORT:-3080}"
+          RUN_MIGRATIONS="${RUN_MIGRATIONS:-false}"
           TMP_DIR="/tmp/strideos-bootstrap"
 
           command -v git >/dev/null 2>&1 || { echo "git no instalado"; exit 1; }
@@ -97,7 +99,11 @@ jobs:
             exit 1
           fi
 
-          docker compose --profile ops run --rm migrate
+          if [ "$RUN_MIGRATIONS" = "true" ]; then
+            docker compose --profile ops run --rm migrate
+          else
+            echo "Saltando migraciones automaticas (RUN_MIGRATIONS=false)."
+          fi
           docker compose up -d --build app
 
           sleep 5
