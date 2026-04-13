@@ -59,6 +59,17 @@ export type RunStravaSyncResult = {
   message: string | null;
 };
 
+export type EnrichStravaStreamsResult = {
+  status: "success" | "throttled";
+  scannedCount: number;
+  updatedCount: number;
+  remainingMissing: number;
+  requestsUsed: number;
+  quota: StravaQuotaSnapshot | null;
+  retryAtUtc: string | null;
+  message: string | null;
+};
+
 type QuotaWindow = {
   used: number;
   limit: number;
@@ -82,6 +93,28 @@ type QuotaGuard = {
   shouldPause: boolean;
   reason: string | null;
   retryAtUtc: string | null;
+};
+
+type JsonRecord = Record<string, unknown>;
+
+const isRecord = (value: unknown): value is JsonRecord =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const hasUsableStreamPayload = (rawPayload: unknown) => {
+  if (!isRecord(rawPayload)) return false;
+  const streams = rawPayload.streams;
+  if (!isRecord(streams)) return false;
+  const distance = streams.distance;
+  const velocity = streams.velocity_smooth;
+  if (!isRecord(distance) || !isRecord(velocity)) return false;
+  const distanceData = distance.data;
+  const velocityData = velocity.data;
+  return (
+    Array.isArray(distanceData) &&
+    Array.isArray(velocityData) &&
+    distanceData.length > 15 &&
+    velocityData.length === distanceData.length
+  );
 };
 
 class StravaQuotaError extends Error {
@@ -584,4 +617,93 @@ export const runStravaSync = async (userId: string, options?: RunStravaSyncOptio
     });
     throw error;
   }
+};
+
+export const enrichMissingStravaStreams = async (
+  userId: string,
+  options?: { maxActivities?: number; maxRequests?: number },
+): Promise<EnrichStravaStreamsResult> => {
+  const maxActivities = Math.max(5, Math.min(options?.maxActivities ?? 30, 80));
+  const maxRequests = Math.max(10, Math.min(options?.maxRequests ?? 80, 180));
+  const accessToken = await ensureValidStravaToken(userId);
+
+  const candidateActivities = await prisma.activity.findMany({
+    where: {
+      userId,
+      source: ActivitySource.STRAVA,
+      sport: { in: [ActivitySport.RUN, ActivitySport.TRAIL_RUN, ActivitySport.TREADMILL] },
+    },
+    orderBy: { startedAt: "desc" },
+    take: 220,
+    select: {
+      id: true,
+      externalId: true,
+      rawPayload: true,
+    },
+  });
+
+  const missing = candidateActivities.filter((item) => !hasUsableStreamPayload(item.rawPayload));
+  const queue = missing.slice(0, maxActivities);
+  let updatedCount = 0;
+  let requestsUsed = 0;
+  let latestQuota: StravaQuotaSnapshot | null = null;
+  let haltedByQuota = false;
+  let quotaStopReason: string | null = null;
+  let retryAtUtc: string | null = null;
+
+  for (const activity of queue) {
+    if (requestsUsed >= maxRequests || haltedByQuota) break;
+    const activityId = Number(activity.externalId);
+    if (!Number.isFinite(activityId)) continue;
+
+    requestsUsed += 1;
+    try {
+      const streamsResult = await fetchActivityStreams(accessToken, activityId);
+      latestQuota = streamsResult.quota ?? latestQuota;
+      if (!streamsResult.data || Object.keys(streamsResult.data).length === 0) {
+        continue;
+      }
+
+      const basePayload = isRecord(activity.rawPayload) ? activity.rawPayload : {};
+      await prisma.activity.update({
+        where: { id: activity.id },
+        data: {
+          rawPayload: {
+            ...basePayload,
+            streams: streamsResult.data,
+          },
+        },
+      });
+      updatedCount += 1;
+    } catch (error) {
+      if (error instanceof StravaQuotaError) {
+        haltedByQuota = true;
+        latestQuota = error.quota ?? latestQuota;
+        quotaStopReason = error.message;
+        retryAtUtc = error.retryAtUtc;
+        break;
+      }
+      continue;
+    }
+
+    const guard = evaluateQuotaGuard(latestQuota);
+    if (guard.shouldPause) {
+      haltedByQuota = true;
+      quotaStopReason = guard.reason;
+      retryAtUtc = guard.retryAtUtc;
+      break;
+    }
+  }
+
+  const remainingMissing = Math.max(0, missing.length - updatedCount);
+  return {
+    status: haltedByQuota ? "throttled" : "success",
+    scannedCount: queue.length,
+    updatedCount,
+    remainingMissing,
+    requestsUsed,
+    quota: latestQuota,
+    retryAtUtc,
+    message: haltedByQuota ? quotaStopReason ?? "Proceso pausado por cuota." : null,
+  };
 };
